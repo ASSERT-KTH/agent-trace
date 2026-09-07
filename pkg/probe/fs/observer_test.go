@@ -244,7 +244,7 @@ func TestDiag_RawFanotify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initFanotify: %v", err)
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 
 	t.Logf("fanotify fd=%d", fd)
 	t.Logf("watchMask=0x%x", watchMask)
@@ -257,7 +257,7 @@ func TestDiag_RawFanotify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openMountFD: %v", err)
 	}
-	defer unix.Close(mountFD)
+	defer func() { _ = unix.Close(mountFD) }()
 	t.Logf("mountFD=%d", mountFD)
 	// Verify mountFD is valid.
 	var st unix.Stat_t
@@ -336,7 +336,7 @@ func TestDiag_RawFanotify(t *testing.T) {
 					} else {
 						link, lerr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", rfd))
 						t.Logf("  info[type=%d]: OpenByHandleAt fd=%d, readlink=%q err=%v", iType, rfd, link, lerr)
-						unix.Close(rfd)
+						_ = unix.Close(rfd)
 					}
 				}
 			}
