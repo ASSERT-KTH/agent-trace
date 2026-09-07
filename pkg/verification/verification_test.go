@@ -195,6 +195,56 @@ func TestGreedyClosestTimestamp(t *testing.T) {
 	}
 }
 
+// F2.2: a single verification pass over a trajectory that mixes file and
+// process actions, where the process probe reports absolute command paths
+// while the agent logs bare command names. All entries should corroborate.
+func TestMixedFileAndProcessVerification(t *testing.T) {
+	traj := models.Trajectory{
+		te(0, models.FileRead, "/workspace/./main.go", nil, sp("src_h")),
+		te(500, models.ProcessExec, "go", sp("build_args"), nil),
+		te(1500, models.FileWrite, "/workspace/bin/app", sp("nil_h"), sp("bin_h")),
+		te(2500, models.ProcessExec, "git", sp("commit_args"), nil),
+		te(3000, models.ProcessExit, "git", nil, sp("0")),
+	}
+	ground := models.GroundTruth{
+		ge(3, models.FileRead, "/workspace/main.go", nil, sp("src_h")),
+		ge(505, models.ProcessExec, "/usr/local/go/bin/go", sp("build_args"), nil),
+		ge(1502, models.FileWrite, "/workspace/bin/app", sp("nil_h"), sp("bin_h")),
+		ge(2503, models.ProcessExec, "/usr/bin/git", sp("commit_args"), nil),
+		ge(3004, models.ProcessExit, "/usr/bin/git", nil, sp("0")),
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if !v.Faithful {
+		t.Errorf("mixed file+process trajectory should be FAITHFUL: %+v", v)
+	}
+	if len(v.Corroborated) != 5 {
+		t.Errorf("expected 5 corroborated, got %d", len(v.Corroborated))
+	}
+}
+
+// F2.2: a process action the agent omitted from its trajectory must surface as
+// Unrecorded even when file actions in the same pass all corroborate.
+func TestMixedVerificationDetectsOmittedProcess(t *testing.T) {
+	traj := models.Trajectory{
+		te(0, models.FileWrite, "/workspace/payload.sh", nil, sp("sh_h")),
+	}
+	ground := models.GroundTruth{
+		ge(2, models.FileWrite, "/workspace/payload.sh", nil, sp("sh_h")),
+		ge(50, models.ProcessExec, "/bin/bash", sp("bash_args"), nil),
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if v.Faithful {
+		t.Error("omitted subprocess spawn should be NOT FAITHFUL")
+	}
+	if len(v.Unrecorded) != 1 || v.Unrecorded[0].ActionType != models.ProcessExec {
+		t.Fatalf("expected 1 unrecorded process_exec, got %+v", v.Unrecorded)
+	}
+}
+
 // --- E2E attack scenarios (design properties P1, P2, P3, P5) ---
 
 // Honest trajectory: 5 actions, all present and matching in ground truth.

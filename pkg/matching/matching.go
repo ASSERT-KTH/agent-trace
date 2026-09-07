@@ -2,6 +2,7 @@ package matching
 
 import (
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/agent-trace/agent-trace/pkg/models"
@@ -17,13 +18,61 @@ func DefaultConfig() Config {
 	return Config{Delta: DefaultDelta}
 }
 
-func normalizeTarget(actionType models.ActionType, target string) string {
+func isFileAction(actionType models.ActionType) bool {
 	switch actionType {
 	case models.FileOpen, models.FileRead, models.FileWrite,
 		models.FileClose, models.FileRename, models.FileDelete:
-		return filepath.Clean(target)
+		return true
 	default:
-		return target
+		return false
+	}
+}
+
+// targetsMatch reports whether a trajectory target and a ground-truth target
+// refer to the same resource, applying per-action-type normalization.
+func targetsMatch(actionType models.ActionType, tTarget, gTarget string) bool {
+	switch {
+	case isFileAction(actionType):
+		normT := filepath.Clean(tTarget)
+		normG := filepath.Clean(gTarget)
+		// A directory-level ground-truth event (fanotify reports the parent
+		// directory for some operations) corroborates a file operation that
+		// happened inside it.
+		return normT == normG || normG == filepath.Dir(normT)
+	case actionType == models.ProcessExec || actionType == models.ProcessExit:
+		return commandsMatch(tTarget, gTarget)
+	default:
+		return tTarget == gTarget
+	}
+}
+
+// commandsMatch compares two command references for a process action. When one
+// side is a bare command name (no path separator) and the other is a path, they
+// match if the path's final element equals the bare name. This absorbs the
+// common case where the agent logs "ls" while an execve probe records
+// "/usr/bin/ls". The comparison is deterministic: it never consults the
+// verifier host's PATH or the filesystem.
+func commandsMatch(a, b string) bool {
+	if a == b {
+		return true
+	}
+
+	aBare := !strings.ContainsRune(a, filepath.Separator)
+	bBare := !strings.ContainsRune(b, filepath.Separator)
+
+	switch {
+	case aBare == bBare:
+		// Both bare names (and unequal, handled above) never match. Two
+		// distinct paths match only if they clean to the same string; we do
+		// not resolve symlinks, which would be non-deterministic.
+		if aBare {
+			return false
+		}
+		return filepath.Clean(a) == filepath.Clean(b)
+	case aBare:
+		return a == filepath.Base(filepath.Clean(b))
+	default:
+		return b == filepath.Base(filepath.Clean(a))
 	}
 }
 
@@ -35,9 +84,7 @@ func Match(t models.TrajectoryEntry, g models.GroundTruthEvent, cfg Config) bool
 		return false
 	}
 
-	normT := normalizeTarget(t.ActionType, t.Target)
-	normG := normalizeTarget(g.ActionType, g.Target)
-	if normT != normG && normG != filepath.Dir(normT) {
+	if !targetsMatch(t.ActionType, t.Target, g.Target) {
 		return false
 	}
 

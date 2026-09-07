@@ -132,6 +132,87 @@ func TestFilePathNormalization(t *testing.T) {
 	}
 }
 
+func TestProcessCommandNormalization(t *testing.T) {
+	cfg := DefaultConfig()
+
+	tests := []struct {
+		name    string
+		tTarget string
+		gTarget string
+		want    bool
+	}{
+		{
+			name:    "bare name vs absolute path",
+			tTarget: "ls",
+			gTarget: "/usr/bin/ls",
+			want:    true,
+		},
+		{
+			name:    "absolute path vs bare name",
+			tTarget: "/bin/echo",
+			gTarget: "echo",
+			want:    true,
+		},
+		{
+			name:    "identical bare names",
+			tTarget: "git",
+			gTarget: "git",
+			want:    true,
+		},
+		{
+			name:    "identical absolute paths",
+			tTarget: "/usr/local/bin/python3",
+			gTarget: "/usr/local/bin/python3",
+			want:    true,
+		},
+		{
+			name:    "path with dot segment vs bare name",
+			tTarget: "/usr/bin/./ls",
+			gTarget: "ls",
+			want:    true,
+		},
+		{
+			name:    "different bare names",
+			tTarget: "ls",
+			gTarget: "cat",
+			want:    false,
+		},
+		{
+			name:    "same basename different directory",
+			tTarget: "/usr/bin/python",
+			gTarget: "/opt/venv/bin/python",
+			want:    false,
+		},
+		{
+			name:    "bare name matches basename but not the other command",
+			tTarget: "sh",
+			gTarget: "/bin/bash",
+			want:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			te := entry(0, models.ProcessExec, tc.tTarget)
+			ge := event(0, models.ProcessExec, tc.gTarget)
+			got := Match(te, ge, cfg)
+			if got != tc.want {
+				t.Errorf("Match(%q, %q) = %v, want %v", tc.tTarget, tc.gTarget, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProcessExitUsesCommandNormalization(t *testing.T) {
+	cfg := DefaultConfig()
+	te := entry(0, models.ProcessExit, "make")
+	ge := event(0, models.ProcessExit, "/usr/bin/make")
+
+	if !Match(te, ge, cfg) {
+		t.Error("process_exit should normalize command paths like process_exec")
+	}
+}
+
 func TestNoNormalizationForNonFileActions(t *testing.T) {
 	cfg := DefaultConfig()
 	te := entry(0, models.NetRequest, "https://api.example.com/v1/chat")
