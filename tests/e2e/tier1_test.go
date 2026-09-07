@@ -63,7 +63,7 @@ func TestTier1_E2E_Faithful(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// 3. Stop the observer and collect ground truth.
-	if err := _ = obs.Stop(); err != nil {
+	if err := obs.Stop(); err != nil {
 		t.Fatalf("obs.Stop: %v", err)
 	}
 

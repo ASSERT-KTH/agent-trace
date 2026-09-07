@@ -91,7 +91,7 @@ func TestObserver_CreateFile(t *testing.T) {
 	obs := startObserver(t, dir)
 
 	target := filepath.Join(dir, "created.txt")
-	if err := _ = os.WriteFile(target, []byte("hello"), 0644); err != nil {
+	if err := os.WriteFile(target, []byte("hello"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -107,13 +107,13 @@ func TestObserver_ModifyFile(t *testing.T) {
 
 	// Pre-create the file before starting the observer so we only see the modify.
 	target := filepath.Join(dir, "modify.txt")
-	if err := _ = os.WriteFile(target, []byte("initial"), 0644); err != nil {
+	if err := os.WriteFile(target, []byte("initial"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	obs := startObserver(t, dir)
 
-	if err := _ = os.WriteFile(target, []byte("modified"), 0644); err != nil {
+	if err := os.WriteFile(target, []byte("modified"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -128,7 +128,7 @@ func TestObserver_DeleteFile(t *testing.T) {
 	dir := t.TempDir()
 
 	target := filepath.Join(dir, "delete-me.txt")
-	if err := _ = os.WriteFile(target, []byte("bye"), 0644); err != nil {
+	if err := os.WriteFile(target, []byte("bye"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -152,7 +152,7 @@ func TestObserver_RenameFile(t *testing.T) {
 
 	src := filepath.Join(dir, "old-name.txt")
 	dst := filepath.Join(dir, "new-name.txt")
-	if err := _ = os.WriteFile(src, []byte("data"), 0644); err != nil {
+	if err := os.WriteFile(src, []byte("data"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -177,7 +177,7 @@ func TestObserver_OpenFile(t *testing.T) {
 	dir := t.TempDir()
 
 	target := filepath.Join(dir, "read-me.txt")
-	if err := _ = os.WriteFile(target, []byte("contents"), 0644); err != nil {
+	if err := os.WriteFile(target, []byte("contents"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -204,7 +204,7 @@ func TestObserver_StopIsClean(t *testing.T) {
 	obs := startObserver(t, dir)
 
 	// Stop without any file operations.
-	if err := _ = obs.Stop(); err != nil {
+	if err := obs.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 
@@ -267,7 +267,7 @@ func TestDiag_RawFanotify(t *testing.T) {
 
 	// Perform a file operation.
 	target := filepath.Join(dir, "diag.txt")
-	if err := _ = os.WriteFile(target, []byte("hello"), 0644); err != nil {
+	if err := os.WriteFile(target, []byte("hello"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("wrote %s, our PID=%d", target, os.Getpid())
