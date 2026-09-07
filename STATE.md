@@ -11,6 +11,7 @@ Tier 1 Filesystem Probe is fully implemented. Awaiting assignment for the next t
 * Ran `go test -v ./tests/e2e` to verify compilation; tests successfully skip when run without `CAP_SYS_ADMIN` privileges.
 * CI Fix (7d6a9cf): Repaired 6 failing GitHub Actions workflows. Removed invalid `if err := _ = ...` syntax from test files (introduced in 44e5269) and bumped golangci-lint-action from v6 to v9.3.0 for Go 1.25 compatibility.
 * Agent docs refactor: Added shared `AGENTS.md` plus thin `CLAUDE.md`, `GEMINI.md`, and `CODEX.md` wrappers that point back to the shared instructions and preserve per-agent commit metadata.
+* Codex attribution line updated in `CODEX.md` to use `Co-Authored-By: codex <codex@openai.com>`.
 
 **Active Context:**
 * Tier 1 E2E tests and components are fully wired and functional.
