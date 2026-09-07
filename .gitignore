@@ -2,6 +2,9 @@
 docs/
 *.html
 
+# Ignore ephemeral agent state
+STATE.md
+
 # Binaries and test artifacts
 *.test
 *.out
