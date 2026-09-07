@@ -1,0 +1,13 @@
+# Ignore the planning, HTML, and research docs as requested
+docs/
+*.html
+
+# Binaries and test artifacts
+*.test
+*.out
+/cmd/simagent/simagent
+
+# OS / Editor specifics
+.DS_Store
+.idea/
+.vscode/
