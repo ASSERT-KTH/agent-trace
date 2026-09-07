@@ -108,7 +108,7 @@ func newKernelResolver(mountFD int) handleResolver {
 		if err != nil {
 			return ""
 		}
-		defer unix.Close(fd)
+		defer func() { _ = unix.Close(fd) }()
 
 		path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
 		if err != nil {

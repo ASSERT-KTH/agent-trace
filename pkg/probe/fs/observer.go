@@ -122,10 +122,10 @@ func (o *Observer) Stop() error {
 	// Wait for readLoop to finish.
 	<-o.stopped
 
-	unix.Close(o.fanotifyFD)
-	unix.Close(o.mountFD)
-	unix.Close(o.stopR)
-	unix.Close(o.stopW)
+	_ = unix.Close(o.fanotifyFD)
+	_ = unix.Close(o.mountFD)
+	_ = unix.Close(o.stopR)
+	_ = unix.Close(o.stopW)
 	close(o.events)
 	return nil
 }
