@@ -68,21 +68,21 @@ func New(cfg Config) (*Observer, error) {
 	}
 
 	if err := markFilesystem(fd, cfg.Path, watchMask); err != nil {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return nil, err
 	}
 
 	mountFD, err := openMountFD(cfg.Path)
 	if err != nil {
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return nil, err
 	}
 
 	// Pipe for signaling the read loop to stop.
 	pipeFDs := [2]int{}
 	if err := unix.Pipe2(pipeFDs[:], unix.O_CLOEXEC); err != nil {
-		unix.Close(fd)
-		unix.Close(mountFD)
+		_ = unix.Close(fd)
+		_ = unix.Close(mountFD)
 		return nil, fmt.Errorf("pipe2: %w", err)
 	}
 
@@ -118,7 +118,7 @@ func (o *Observer) Start() {
 // file descriptors. The events channel is closed after Stop returns.
 func (o *Observer) Stop() error {
 	// Signal the poll loop.
-	unix.Write(o.stopW, []byte{0})
+	_, _ = unix.Write(o.stopW, []byte{0})
 	// Wait for readLoop to finish.
 	<-o.stopped
 

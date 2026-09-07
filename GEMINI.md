@@ -46,3 +46,6 @@ The `STATE.md` file should be kept concise and structured. It should ideally con
 
 ## Golden Rule
 **If it's not in `STATE.md`, the next agent won't know about it.** Project all transient reasoning and discoveries into the structured state before you finish!
+
+## Agentic CI & TDD
+**Shift Left via Agent Self-Correction:** Before you attempt to commit any code or state that you have finished your turn, you MUST locally run `sudo go test -v ./...` and `go vet ./...` (or `golangci-lint run` if available). Act as your own IDE. Never commit broken code or ignore unhandled errors. If a test or linter fails, fix it immediately.

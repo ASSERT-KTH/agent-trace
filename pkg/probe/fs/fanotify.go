@@ -136,6 +136,11 @@ func parseEvents(buf []byte, n int, resolve handleResolver) []rawEvent {
 			continue
 		}
 
+		// Ensure fd is closed to avoid leak
+		if meta.FD >= 0 {
+			_ = unix.Close(int(meta.FD))
+		}
+
 		// Info records follow the metadata header.
 		infoStart := offset + int(meta.MetadataLen)
 		infoEnd := offset + int(meta.EventLen)

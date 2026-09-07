@@ -91,12 +91,12 @@ func TestObserver_CreateFile(t *testing.T) {
 	obs := startObserver(t, dir)
 
 	target := filepath.Join(dir, "created.txt")
-	if err := os.WriteFile(target, []byte("hello"), 0644); err != nil {
+	if err := _ = os.WriteFile(target, []byte("hello"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	events := collectEvents(obs, 500*time.Millisecond)
-	obs.Stop()
+	_ = obs.Stop()
 
 	assertHasEvent(t, events, models.FileWrite, target)
 }
@@ -107,18 +107,18 @@ func TestObserver_ModifyFile(t *testing.T) {
 
 	// Pre-create the file before starting the observer so we only see the modify.
 	target := filepath.Join(dir, "modify.txt")
-	if err := os.WriteFile(target, []byte("initial"), 0644); err != nil {
+	if err := _ = os.WriteFile(target, []byte("initial"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	obs := startObserver(t, dir)
 
-	if err := os.WriteFile(target, []byte("modified"), 0644); err != nil {
+	if err := _ = os.WriteFile(target, []byte("modified"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	events := collectEvents(obs, 500*time.Millisecond)
-	obs.Stop()
+	_ = obs.Stop()
 
 	assertHasEvent(t, events, models.FileWrite, target)
 }
@@ -128,7 +128,7 @@ func TestObserver_DeleteFile(t *testing.T) {
 	dir := t.TempDir()
 
 	target := filepath.Join(dir, "delete-me.txt")
-	if err := os.WriteFile(target, []byte("bye"), 0644); err != nil {
+	if err := _ = os.WriteFile(target, []byte("bye"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -139,7 +139,7 @@ func TestObserver_DeleteFile(t *testing.T) {
 	}
 
 	events := collectEvents(obs, 500*time.Millisecond)
-	obs.Stop()
+	_ = obs.Stop()
 
 	// On tmpfs, DELETE resolves to the parent directory only (DFID without
 	// filename). On ext4/xfs, DFID_NAME provides the full path.
@@ -152,7 +152,7 @@ func TestObserver_RenameFile(t *testing.T) {
 
 	src := filepath.Join(dir, "old-name.txt")
 	dst := filepath.Join(dir, "new-name.txt")
-	if err := os.WriteFile(src, []byte("data"), 0644); err != nil {
+	if err := _ = os.WriteFile(src, []byte("data"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -163,7 +163,7 @@ func TestObserver_RenameFile(t *testing.T) {
 	}
 
 	events := collectEvents(obs, 500*time.Millisecond)
-	obs.Stop()
+	_ = obs.Stop()
 
 	// Rename produces MOVED_FROM (source) and MOVED_TO (destination),
 	// both mapped to FileRename. On tmpfs, these resolve to the parent
@@ -177,7 +177,7 @@ func TestObserver_OpenFile(t *testing.T) {
 	dir := t.TempDir()
 
 	target := filepath.Join(dir, "read-me.txt")
-	if err := os.WriteFile(target, []byte("contents"), 0644); err != nil {
+	if err := _ = os.WriteFile(target, []byte("contents"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -189,11 +189,11 @@ func TestObserver_OpenFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf := make([]byte, 64)
-	f.Read(buf)
-	f.Close()
+	_, _ = f.Read(buf)
+	_ = f.Close()
 
 	events := collectEvents(obs, 500*time.Millisecond)
-	obs.Stop()
+	_ = obs.Stop()
 
 	assertHasEvent(t, events, models.FileOpen, target)
 }
@@ -204,7 +204,7 @@ func TestObserver_StopIsClean(t *testing.T) {
 	obs := startObserver(t, dir)
 
 	// Stop without any file operations.
-	if err := obs.Stop(); err != nil {
+	if err := _ = obs.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
 
@@ -222,11 +222,11 @@ func TestObserver_NoOverflow(t *testing.T) {
 
 	// Small burst of operations.
 	for i := 0; i < 10; i++ {
-		os.WriteFile(filepath.Join(dir, "burst.txt"), []byte("x"), 0644)
+		_ = os.WriteFile(filepath.Join(dir, "burst.txt"), []byte("x"), 0644)
 	}
 
 	collectEvents(obs, 500*time.Millisecond)
-	obs.Stop()
+	_ = obs.Stop()
 
 	if obs.Overflow() {
 		t.Error("unexpected queue overflow on a small burst")
@@ -267,7 +267,7 @@ func TestDiag_RawFanotify(t *testing.T) {
 
 	// Perform a file operation.
 	target := filepath.Join(dir, "diag.txt")
-	if err := os.WriteFile(target, []byte("hello"), 0644); err != nil {
+	if err := _ = os.WriteFile(target, []byte("hello"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("wrote %s, our PID=%d", target, os.Getpid())
