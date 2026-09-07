@@ -22,10 +22,6 @@ jobs:
     - name: Download dependencies
       run: go mod download
 
-    - name: Run unprivileged logic tests
-      run: go test -v ./pkg/models ./pkg/matching ./pkg/verification
-
-    - name: Run privileged probe & E2E tests (requires sudo)
-      # GitHub Actions runners allow passwordless sudo!
-      # This runs the tests that would normally be skipped on a local unprivileged machine.
-      run: sudo go test -v ./pkg/probe/fs ./tests/e2e
+    - name: Run all tests (Unit, Integration, and E2E)
+      # We run everything with sudo so the eBPF/fanotify tests execute fully
+      run: sudo go test -v ./...
