@@ -42,7 +42,7 @@ jobs:
     - name: Install clang and libbpf headers
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y clang libbpf-dev
+        sudo apt-get install -y clang llvm libbpf-dev
 
     - name: Regenerate BPF objects
       run: go generate ./pkg/probe/proc/...
