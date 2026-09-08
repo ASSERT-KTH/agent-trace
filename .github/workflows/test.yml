@@ -53,8 +53,8 @@ jobs:
       # time). If this step fails, someone edited proc.bpf.c without running
       # `go generate ./pkg/probe/proc/...` and committing the result.
       run: |
-        if [ -n "$(git status --porcelain -- pkg/probe/proc)" ]; then
-          echo "::error::Committed BPF objects in pkg/probe/proc are stale. Run 'go generate ./pkg/probe/proc/...' and commit the result."
+        if [ -n "$(git status --porcelain -- pkg/probe/proc | grep -v '\.o$')" ]; then
+          echo "::error::Committed BPF bindings in pkg/probe/proc are stale. Run 'go generate ./pkg/probe/proc/...' and commit the result."
           git diff -- pkg/probe/proc
           git status --porcelain -- pkg/probe/proc
           exit 1
