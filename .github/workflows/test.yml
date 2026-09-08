@@ -25,3 +25,37 @@ jobs:
     - name: Run all tests (Unit, Integration, and E2E)
       # We run everything with sudo so the eBPF/fanotify tests execute fully
       run: sudo go test -v ./...
+
+  bpf-freshness:
+    name: BPF Objects Up To Date
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+    - name: Set up Go
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      with:
+        go-version: '1.25.0'
+
+    - name: Install clang and libbpf headers
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y clang libbpf-dev
+
+    - name: Regenerate BPF objects
+      run: go generate ./pkg/probe/proc/...
+
+    - name: Fail if regeneration changed committed files
+      # proc.bpf.c is compiled locally and its .o/.go bindings are committed
+      # (CI has no clang in the test job, so it can't build them at test
+      # time). If this step fails, someone edited proc.bpf.c without running
+      # `go generate ./pkg/probe/proc/...` and committing the result.
+      run: |
+        if [ -n "$(git status --porcelain -- pkg/probe/proc)" ]; then
+          echo "::error::Committed BPF objects in pkg/probe/proc are stale. Run 'go generate ./pkg/probe/proc/...' and commit the result."
+          git diff -- pkg/probe/proc
+          git status --porcelain -- pkg/probe/proc
+          exit 1
+        fi

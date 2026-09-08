@@ -20,7 +20,7 @@ Tier 2 Process Probe. Three reviewable units: (1) F2.2 mixed verification + comm
 
 **Active Context:**
 * `go test ./...` unprivileged is misleading: every fs, proc, and Tier 1 E2E test skips without root — only Tier 0 and matching/verification unit tests actually execute that way. Always confirm probe changes with `sudo go test -v ./...` before trusting green.
-* Stale-artifact hazard remains open: `bpf_bpfel.o` / `bpf_bpfeb.o` are committed and CI has no clang, so editing `proc.bpf.c` without re-running `go generate ./pkg/probe/proc/...` silently ships the previous program. No CI guard for this yet (see Next Steps).
+* Stale-artifact hazard closed: new `bpf-freshness` job in `.github/workflows/test.yml` installs clang + libbpf-dev, runs `go generate ./pkg/probe/proc/...`, and fails the build if that dirties `pkg/probe/proc`. Verified locally by editing `proc.bpf.c`, confirming the check fails, then reverting.
 * Tier 1 E2E is incomplete vs plan: the plan lists four scenarios (honest, drop entry, add fake entry, swap filename). Only honest and omission exist at the E2E level. Fabrication and filename swap are covered at Tier 0 with synthetic data but not E2E.
 * `models.TrajectoryEntry.Target` is still a single string with no dedicated args field; process entries pack args into the target (e.g. "git commit -m fix"). Unchanged by this pass.
 * CI runs `sudo go test -v ./...`, so this commit is the first time the privileged proc tests execute on a GitHub Actions runner — watch the first run.
@@ -28,7 +28,6 @@ Tier 2 Process Probe. Three reviewable units: (1) F2.2 mixed verification + comm
 * golangci-lint is not in PATH; `~/go/bin/golangci-lint` is a stale v1.59.1 broken on this toolchain. Install v2.13.2 into a scratchpad via `GOBIN=<scratchpad> go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2` (it self-upgrades the toolchain to go1.26.8 via GOTOOLCHAIN on install, that's expected).
 
 **Next Steps:**
-1. Commit F2.1 (this session's work) with go.mod/go.sum (cilium/ebpf v0.19.0). Watch the first CI run.
-2. Add a CI guard that re-runs `go generate ./...` and fails if the committed `.o`/`.go` bindings change, to catch the stale-artifact hazard.
-3. Tier 2 unit 3: extend `cmd/simagent` with subprocess execution (os/exec), add `tests/e2e/tier2_test.go` (mixed file + process trajectory, honest and mutated — reuse the T1/T2/T3 attack shape from Tier 0/1).
-4. Backfill the two missing Tier 1 E2E scenarios (fabrication, filename swap) to match the plan's four-scenario list.
+1. Commit the `bpf-freshness` CI guard. Watch the first run of both `test.yml` jobs on the runner (first time F2.1 executes there at all).
+2. Tier 2 unit 3: extend `cmd/simagent` with subprocess execution (os/exec), add `tests/e2e/tier2_test.go` (mixed file + process trajectory, honest and mutated — reuse the T1/T2/T3 attack shape from Tier 0/1).
+3. Backfill the two missing Tier 1 E2E scenarios (fabrication, filename swap) to match the plan's four-scenario list.
