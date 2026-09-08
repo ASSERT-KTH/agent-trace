@@ -1,0 +1,198 @@
+package proc
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/agent-trace/agent-trace/pkg/models"
+)
+
+func skipUnprivileged(t *testing.T) {
+	t.Helper()
+	if os.Getuid() != 0 {
+		t.Skip("requires root or CAP_BPF+CAP_PERFMON")
+	}
+}
+
+// collect drains the observer's event channel until it is closed.
+func collect(obs *Observer) []models.GroundTruthEvent {
+	var got []models.GroundTruthEvent
+	for e := range obs.Events() {
+		got = append(got, e)
+	}
+	return got
+}
+
+func TestObserver_CapturesExecAndExit(t *testing.T) {
+	skipUnprivileged(t)
+
+	nonce := fmt.Sprintf("agenttrace-%d", time.Now().UnixNano())
+
+	obs, err := New(Config{
+		CommandFilter: "/bin/echo",
+		EventBufSize:  256,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	obs.Start()
+
+	// Give the tracepoints a moment to attach before generating events.
+	time.Sleep(150 * time.Millisecond)
+
+	if err := exec.Command("/bin/echo", nonce).Run(); err != nil {
+		t.Fatalf("spawn echo: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if err := obs.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	got := collect(obs)
+
+	var sawExec, sawExit bool
+	for _, e := range got {
+		if !strings.Contains(e.Target, nonce) {
+			continue
+		}
+		if e.Target != "/bin/echo "+nonce {
+			t.Errorf("unexpected target %q, want %q", e.Target, "/bin/echo "+nonce)
+		}
+		switch e.ActionType {
+		case models.ProcessExec:
+			sawExec = true
+		case models.ProcessExit:
+			sawExit = true
+		default:
+			t.Errorf("unexpected action type %q", e.ActionType)
+		}
+		if e.Timestamp.IsZero() {
+			t.Error("event has zero timestamp")
+		}
+	}
+
+	if !sawExec {
+		t.Errorf("no process_exec event for %q; got %d events: %v", nonce, len(got), got)
+	}
+	if !sawExit {
+		t.Errorf("no process_exit event for %q; got %d events: %v", nonce, len(got), got)
+	}
+}
+
+func TestObserver_ExitCodeAndTimestamps(t *testing.T) {
+	skipUnprivileged(t)
+
+	nonce := fmt.Sprintf("agenttrace-exit-%d", time.Now().UnixNano())
+
+	obs, err := New(Config{
+		CommandFilter: "/bin/sh",
+		EventBufSize:  256,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	obs.Start()
+	time.Sleep(150 * time.Millisecond)
+
+	before := time.Now()
+	// Deliberately nonzero, to confirm the probe reports the code the
+	// process actually returned rather than defaulting to 0.
+	_ = exec.Command("/bin/sh", "-c", fmt.Sprintf("echo %s; exit 7", nonce)).Run()
+	after := time.Now()
+
+	time.Sleep(300 * time.Millisecond)
+	if err := obs.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	got := collect(obs)
+
+	var execEvent, exitEvent *models.GroundTruthEvent
+	for i := range got {
+		if !strings.Contains(got[i].Target, nonce) {
+			continue
+		}
+		switch got[i].ActionType {
+		case models.ProcessExec:
+			execEvent = &got[i]
+		case models.ProcessExit:
+			exitEvent = &got[i]
+		}
+	}
+	if execEvent == nil || exitEvent == nil {
+		t.Fatalf("missing exec (%v) or exit (%v) event for %q; got %d events: %v",
+			execEvent != nil, exitEvent != nil, nonce, len(got), got)
+	}
+
+	if exitEvent.ExitCode == nil {
+		t.Fatal("exit event has nil ExitCode")
+	}
+	if *exitEvent.ExitCode != 7 {
+		t.Errorf("ExitCode = %d, want 7", *exitEvent.ExitCode)
+	}
+	if execEvent.ExitCode != nil {
+		t.Errorf("exec event has non-nil ExitCode %d, want nil", *execEvent.ExitCode)
+	}
+
+	// The kernel timestamps (bpf_ktime_get_ns + userspace boot offset)
+	// should land inside a generous window around the actual wall-clock
+	// window in which the command ran, and exec must not be reported after
+	// exit.
+	window := 2 * time.Second
+	lo, hi := before.Add(-window), after.Add(window)
+	if execEvent.Timestamp.Before(lo) || execEvent.Timestamp.After(hi) {
+		t.Errorf("exec timestamp %v outside expected window [%v, %v]", execEvent.Timestamp, lo, hi)
+	}
+	if exitEvent.Timestamp.Before(lo) || exitEvent.Timestamp.After(hi) {
+		t.Errorf("exit timestamp %v outside expected window [%v, %v]", exitEvent.Timestamp, lo, hi)
+	}
+	if exitEvent.Timestamp.Before(execEvent.Timestamp) {
+		t.Errorf("exit timestamp %v before exec timestamp %v", exitEvent.Timestamp, execEvent.Timestamp)
+	}
+}
+
+func TestObserver_CommandFilterExcludesOthers(t *testing.T) {
+	skipUnprivileged(t)
+
+	obs, err := New(Config{
+		CommandFilter: "/nonexistent/path/prefix",
+		EventBufSize:  256,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	obs.Start()
+	time.Sleep(150 * time.Millisecond)
+
+	_ = exec.Command("/bin/true").Run()
+	_ = exec.Command("/bin/ls", "/").Run()
+
+	time.Sleep(300 * time.Millisecond)
+	_ = obs.Stop()
+
+	if got := collect(obs); len(got) != 0 {
+		t.Errorf("expected no events past the filter, got %d: %v", len(got), got)
+	}
+}
+
+func TestObserver_StopIsIdempotent(t *testing.T) {
+	skipUnprivileged(t)
+
+	obs, err := New(Config{EventBufSize: 16})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	obs.Start()
+
+	if err := obs.Stop(); err != nil {
+		t.Fatalf("first Stop: %v", err)
+	}
+	if err := obs.Stop(); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+}

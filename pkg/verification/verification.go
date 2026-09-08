@@ -31,6 +31,18 @@ func hashesAgree(a, b *string) bool {
 	return *a == *b
 }
 
+// exitCodesAgree compares two optional process exit codes with the same
+// nil-agreement rule as hashesAgree: if either side didn't report one, we
+// cannot disprove the claim. A mismatch requires both sides to report a
+// code and for those codes to differ -- e.g. the agent claims a command
+// succeeded while the ground truth shows it exited nonzero.
+func exitCodesAgree(a, b *int32) bool {
+	if a == nil || b == nil {
+		return true
+	}
+	return *a == *b
+}
+
 // Verify compares a self-reported trajectory T against an independently
 // observed ground truth G and classifies every entry/event into one of
 // four sets: Corroborated, Unwitnessed, Unrecorded, or Mismatched.
@@ -73,8 +85,9 @@ func Verify(t models.Trajectory, g models.GroundTruth, cfg matching.Config) Verd
 
 		inputOK := hashesAgree(entry.InputHash, g[bestIdx].InputHash)
 		outputOK := hashesAgree(entry.OutputHash, g[bestIdx].OutputHash)
+		exitOK := exitCodesAgree(entry.ExitCode, g[bestIdx].ExitCode)
 
-		if inputOK && outputOK {
+		if inputOK && outputOK && exitOK {
 			v.Corroborated = append(v.Corroborated, pair)
 		} else {
 			v.Mismatched = append(v.Mismatched, pair)

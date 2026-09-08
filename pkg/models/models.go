@@ -13,6 +13,10 @@ type TrajectoryEntry struct {
 	Target     string      `json:"target"`
 	InputHash  *string     `json:"input_hash,omitempty"`
 	OutputHash *string     `json:"output_hash,omitempty"`
+	// ExitCode is the process exit code for ProcessExit entries. Nil means
+	// not reported (e.g. the action isn't a process exit, or the reporter
+	// couldn't determine it).
+	ExitCode *int32 `json:"exit_code,omitempty"`
 }
 
 // GroundTruthEvent is an independently observed action from the host-level probes.
@@ -22,6 +26,10 @@ type GroundTruthEvent struct {
 	Target     string      `json:"target"`
 	InputHash  *string     `json:"input_hash,omitempty"`
 	OutputHash *string     `json:"output_hash,omitempty"`
+	// ExitCode is the process exit code for ProcessExit events. Nil means
+	// unknown, e.g. the process was killed by an uncaught signal rather than
+	// calling exit()/_exit().
+	ExitCode *int32 `json:"exit_code,omitempty"`
 }
 
 func (e *TrajectoryEntry) Validate() error {

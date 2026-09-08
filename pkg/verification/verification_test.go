@@ -152,6 +152,51 @@ func TestHashNilTreatedAsAgreement(t *testing.T) {
 	}
 }
 
+func TestExitCodeMismatch(t *testing.T) {
+	claimedOK := int32(0)
+	actualFailed := int32(1)
+	traj := models.Trajectory{
+		{Timestamp: baseTime, ActionType: models.ProcessExit, Target: "/usr/bin/git push", ExitCode: &claimedOK},
+	}
+	ground := models.GroundTruth{
+		{Timestamp: baseTime.Add(5 * time.Millisecond), ActionType: models.ProcessExit, Target: "/usr/bin/git push", ExitCode: &actualFailed},
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if v.Faithful {
+		t.Error("expected NOT FAITHFUL: agent claimed exit 0 but process exited 1")
+	}
+	if len(v.Mismatched) != 1 {
+		t.Fatalf("expected 1 mismatched, got %d", len(v.Mismatched))
+	}
+	if *v.Mismatched[0].Entry.ExitCode != 0 || *v.Mismatched[0].Event.ExitCode != 1 {
+		t.Errorf("wrong exit codes in mismatch: entry=%d event=%d",
+			*v.Mismatched[0].Entry.ExitCode, *v.Mismatched[0].Event.ExitCode)
+	}
+}
+
+func TestExitCodeNilTreatedAsAgreement(t *testing.T) {
+	code := int32(0)
+	traj := models.Trajectory{
+		{Timestamp: baseTime, ActionType: models.ProcessExit, Target: "/usr/bin/git push", ExitCode: &code},
+	}
+	ground := models.GroundTruth{
+		// Probe didn't capture an exit code (e.g. killed by an uncaught
+		// signal, never hit exit_group): should not be a mismatch.
+		{Timestamp: baseTime.Add(5 * time.Millisecond), ActionType: models.ProcessExit, Target: "/usr/bin/git push"},
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if !v.Faithful {
+		t.Error("nil ground-truth exit code should not cause mismatch")
+	}
+	if len(v.Corroborated) != 1 {
+		t.Errorf("expected 1 corroborated, got %d", len(v.Corroborated))
+	}
+}
+
 func TestEmptyTrajectoryAndGroundTruth(t *testing.T) {
 	v := Verify(nil, nil, cfg)
 
