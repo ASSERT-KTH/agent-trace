@@ -45,14 +45,14 @@ type Config struct {
 
 // Observer watches filesystem events via fanotify and emits GroundTruthEvents.
 type Observer struct {
-	fanotifyFD int
-	mountFD    int
-	stopR      int // read end of stop-signal pipe
-	stopW      int // write end of stop-signal pipe
-	events     chan models.GroundTruthEvent
-	stopped    chan struct{}
-	cfg        Config
-	overflow   bool // true if FAN_Q_OVERFLOW was seen
+	fanotifyFD       int
+	mountFD          int
+	stopR            int // read end of stop-signal pipe
+	stopW            int // write end of stop-signal pipe
+	events           chan models.GroundTruthEvent
+	stopped          chan struct{}
+	cfg              Config
+	overflow         bool // true if FAN_Q_OVERFLOW was seen
 	pendingHashOpens map[string]int
 	mu               sync.Mutex
 	wg               sync.WaitGroup
@@ -93,13 +93,13 @@ func New(cfg Config) (*Observer, error) {
 	}
 
 	return &Observer{
-		fanotifyFD: fd,
-		mountFD:    mountFD,
-		stopR:      pipeFDs[0],
-		stopW:      pipeFDs[1],
-		events:     make(chan models.GroundTruthEvent, cfg.EventBufSize),
-		stopped:    make(chan struct{}),
-		cfg:        cfg,
+		fanotifyFD:       fd,
+		mountFD:          mountFD,
+		stopR:            pipeFDs[0],
+		stopW:            pipeFDs[1],
+		events:           make(chan models.GroundTruthEvent, cfg.EventBufSize),
+		stopped:          make(chan struct{}),
+		cfg:              cfg,
 		pendingHashOpens: make(map[string]int),
 	}, nil
 }

@@ -14,11 +14,15 @@ type MatchedPair struct {
 }
 
 type Verdict struct {
-	Faithful    bool
+	Faithful     bool
 	Corroborated []MatchedPair
 	Unwitnessed  []models.TrajectoryEntry
 	Unrecorded   []models.GroundTruthEvent
 	Mismatched   []MatchedPair
+}
+
+func isTopLevel(event models.GroundTruthEvent) bool {
+	return event.IsTopLevel == nil || *event.IsTopLevel
 }
 
 // hashesAgree compares two optional hashes. If either side is nil (content
@@ -59,7 +63,7 @@ func Verify(t models.Trajectory, g models.GroundTruth, cfg matching.Config) Verd
 		bestDiff := time.Duration(math.MaxInt64)
 
 		for j, event := range g {
-			if matched[j] {
+			if matched[j] || !isTopLevel(event) {
 				continue
 			}
 			if !matching.Match(entry, event, cfg) {
@@ -95,7 +99,7 @@ func Verify(t models.Trajectory, g models.GroundTruth, cfg matching.Config) Verd
 	}
 
 	for j, event := range g {
-		if !matched[j] {
+		if !matched[j] && isTopLevel(event) {
 			v.Unrecorded = append(v.Unrecorded, event)
 		}
 	}

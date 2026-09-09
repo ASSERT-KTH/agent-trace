@@ -22,20 +22,30 @@ type bpfEvent struct {
 	TsNs        int64
 	ExitCode    int32
 	HasExitCode uint8
+	IsToplevel  uint8
 	Args        [1536]int8
-	_           [3]byte
+	_           [2]byte
+}
+
+type bpfProcInfo struct {
+	_          structs.HostLayout
+	IsShell    uint8
+	IsToplevel uint8
 }
 
 // Names of all BPF objects in the ELF.
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
+	bpfMapConfigMap        = "config_map"
 	bpfMapEvents           = "events"
 	bpfMapExecs            = "execs"
 	bpfMapHeap             = "heap"
+	bpfMapTrackedPids      = "tracked_pids"
 	bpfProgHandleExecve    = "handle_execve"
 	bpfProgHandleExit      = "handle_exit"
 	bpfProgHandleExitGroup = "handle_exit_group"
+	bpfProgHandleFork      = "handle_fork"
 )
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -83,15 +93,18 @@ type bpfProgramSpecs struct {
 	HandleExecve    *ebpf.ProgramSpec `ebpf:"handle_execve"`
 	HandleExit      *ebpf.ProgramSpec `ebpf:"handle_exit"`
 	HandleExitGroup *ebpf.ProgramSpec `ebpf:"handle_exit_group"`
+	HandleFork      *ebpf.ProgramSpec `ebpf:"handle_fork"`
 }
 
 // bpfMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	Events *ebpf.MapSpec `ebpf:"events"`
-	Execs  *ebpf.MapSpec `ebpf:"execs"`
-	Heap   *ebpf.MapSpec `ebpf:"heap"`
+	ConfigMap   *ebpf.MapSpec `ebpf:"config_map"`
+	Events      *ebpf.MapSpec `ebpf:"events"`
+	Execs       *ebpf.MapSpec `ebpf:"execs"`
+	Heap        *ebpf.MapSpec `ebpf:"heap"`
+	TrackedPids *ebpf.MapSpec `ebpf:"tracked_pids"`
 }
 
 // bpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -120,16 +133,20 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	Events *ebpf.Map `ebpf:"events"`
-	Execs  *ebpf.Map `ebpf:"execs"`
-	Heap   *ebpf.Map `ebpf:"heap"`
+	ConfigMap   *ebpf.Map `ebpf:"config_map"`
+	Events      *ebpf.Map `ebpf:"events"`
+	Execs       *ebpf.Map `ebpf:"execs"`
+	Heap        *ebpf.Map `ebpf:"heap"`
+	TrackedPids *ebpf.Map `ebpf:"tracked_pids"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
+		m.ConfigMap,
 		m.Events,
 		m.Execs,
 		m.Heap,
+		m.TrackedPids,
 	)
 }
 
@@ -146,6 +163,7 @@ type bpfPrograms struct {
 	HandleExecve    *ebpf.Program `ebpf:"handle_execve"`
 	HandleExit      *ebpf.Program `ebpf:"handle_exit"`
 	HandleExitGroup *ebpf.Program `ebpf:"handle_exit_group"`
+	HandleFork      *ebpf.Program `ebpf:"handle_fork"`
 }
 
 func (p *bpfPrograms) Close() error {
@@ -153,6 +171,7 @@ func (p *bpfPrograms) Close() error {
 		p.HandleExecve,
 		p.HandleExit,
 		p.HandleExitGroup,
+		p.HandleFork,
 	)
 }
 

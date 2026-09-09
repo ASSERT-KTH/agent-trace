@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,27 +35,38 @@ func runTier2Agent(t *testing.T) (models.Trajectory, models.GroundTruth) {
 		t.Fatalf("fs.New: %v", err)
 	}
 
-	// Scope the process probe to the single command the agent runs
-	// ("wc -l <workspace>/file2.txt"). Without a filter the probe would also
-	// report the simagent process's own execve, which the agent does not and
-	// should not record, plus any unrelated command on a shared host.
 	procObs, err := proc.New(proc.Config{
-		CommandFilter: "wc -l " + workspace,
-		EventBufSize:  256,
+		EventBufSize: 256,
 	})
 	if err != nil {
 		t.Fatalf("proc.New: %v", err)
 	}
 
 	fsObs.Start()
-	procObs.Start()
-	// Let the fanotify marks and the eBPF tracepoints attach before the agent
-	// generates any events.
+	// New attaches the eBPF tracepoints; only the fanotify observer needs its
+	// reader started before the agent begins.
 	time.Sleep(200 * time.Millisecond)
 
 	cmd := exec.Command(binPath, "--workspace", workspace, "--trajectory-out", trajectoryPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("simagent failed: %v\n%s", err, string(out))
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start simagent: %v", err)
+	}
+	// The process is the ancestry root. SetRootPID must happen after Start so
+	// the OS-assigned PID is available, but before the agent reaches its child
+	// command later in the run.
+	if err := procObs.SetRootPID(int32(cmd.Process.Pid)); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("procObs.SetRootPID: %v", err)
+	}
+	// Start reading only after the root is known. The root's initial execve is
+	// already buffered, but readLoop can now reliably suppress it.
+	procObs.Start()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("simagent failed: %v\n%s", err, output.String())
 	}
 
 	// Let the kernel deliver, and both probes drain, the trailing events.

@@ -8,11 +8,11 @@ import (
 
 // TrajectoryEntry is a self-reported action from the agent's trajectory log.
 type TrajectoryEntry struct {
-	Timestamp  time.Time   `json:"timestamp"`
-	ActionType ActionType  `json:"action_type"`
-	Target     string      `json:"target"`
-	InputHash  *string     `json:"input_hash,omitempty"`
-	OutputHash *string     `json:"output_hash,omitempty"`
+	Timestamp  time.Time  `json:"timestamp"`
+	ActionType ActionType `json:"action_type"`
+	Target     string     `json:"target"`
+	InputHash  *string    `json:"input_hash,omitempty"`
+	OutputHash *string    `json:"output_hash,omitempty"`
 	// ExitCode is the process exit code for ProcessExit entries. Nil means
 	// not reported (e.g. the action isn't a process exit, or the reporter
 	// couldn't determine it).
@@ -21,15 +21,19 @@ type TrajectoryEntry struct {
 
 // GroundTruthEvent is an independently observed action from the host-level probes.
 type GroundTruthEvent struct {
-	Timestamp  time.Time   `json:"timestamp"`
-	ActionType ActionType  `json:"action_type"`
-	Target     string      `json:"target"`
-	InputHash  *string     `json:"input_hash,omitempty"`
-	OutputHash *string     `json:"output_hash,omitempty"`
+	Timestamp  time.Time  `json:"timestamp"`
+	ActionType ActionType `json:"action_type"`
+	Target     string     `json:"target"`
+	InputHash  *string    `json:"input_hash,omitempty"`
+	OutputHash *string    `json:"output_hash,omitempty"`
 	// ExitCode is the process exit code for ProcessExit events. Nil means
 	// unknown, e.g. the process was killed by an uncaught signal rather than
 	// calling exit()/_exit().
 	ExitCode *int32 `json:"exit_code,omitempty"`
+	// IsTopLevel identifies verification-grade events generated directly by
+	// the tracked root process or one of its direct children. A nil value is
+	// legacy data and is treated as top-level for backward compatibility.
+	IsTopLevel *bool `json:"is_top_level,omitempty"`
 }
 
 func (e *TrajectoryEntry) Validate() error {

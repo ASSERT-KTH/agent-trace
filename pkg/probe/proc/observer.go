@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
@@ -38,7 +39,9 @@ const argSlot = 128
 
 // Config controls the observer's behavior.
 type Config struct {
-	// PIDFilter, if > 0, restricts emitted events to this thread-group ID.
+	// PIDFilter, if > 0, restricts emitted events to this process tree. The
+	// configured PID is the ancestry root; its direct children are top-level
+	// events and deeper descendants are forensic-only events.
 	PIDFilter int32
 
 	// CommandFilter, if non-empty, restricts emitted events to commands whose
@@ -55,6 +58,7 @@ type Config struct {
 type Observer struct {
 	objs          bpfObjects
 	execLink      link.Link
+	forkLink      link.Link
 	exitLink      link.Link
 	exitGroupLink link.Link
 	reader        *ringbuf.Reader
@@ -94,6 +98,27 @@ func New(cfg Config) (*Observer, error) {
 		return nil, fmt.Errorf("load eBPF objects: %w", err)
 	}
 
+	if cfg.PIDFilter > 0 {
+		zero := uint32(0)
+		one := uint8(1)
+		if err := objs.ConfigMap.Update(&zero, &one, ebpf.UpdateAny); err != nil {
+			_ = objs.Close()
+			return nil, fmt.Errorf("update config_map: %w", err)
+		}
+		pid := uint32(cfg.PIDFilter)
+		info := bpfProcInfo{IsShell: 1}
+		if err := objs.TrackedPids.Update(&pid, &info, ebpf.UpdateAny); err != nil {
+			_ = objs.Close()
+			return nil, fmt.Errorf("update tracked_pids: %w", err)
+		}
+	}
+
+	forkLink, err := link.Tracepoint("task", "task_newtask", objs.HandleFork, nil)
+	if err != nil {
+		_ = objs.Close()
+		return nil, fmt.Errorf("attach task_newtask: %w", err)
+	}
+
 	execLink, err := link.Tracepoint("syscalls", "sys_enter_execve", objs.HandleExecve, nil)
 	if err != nil {
 		_ = objs.Close()
@@ -127,6 +152,7 @@ func New(cfg Config) (*Observer, error) {
 	return &Observer{
 		objs:          objs,
 		execLink:      execLink,
+		forkLink:      forkLink,
 		exitLink:      exitLink,
 		exitGroupLink: exitGroupLink,
 		reader:        reader,
@@ -176,6 +202,7 @@ func (o *Observer) Stop() error {
 		<-o.stopped
 		_ = o.exitLink.Close()
 		_ = o.exitGroupLink.Close()
+		_ = o.forkLink.Close()
 		_ = o.execLink.Close()
 		_ = o.objs.Close()
 		close(o.events)
@@ -203,6 +230,12 @@ func (o *Observer) readLoop() {
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &raw); err != nil {
 			continue
 		}
+		// The root process's initial exec can happen before SetRootPID installs
+		// the ancestry filter. The root itself is the controller, not an agent
+		// action, so never expose its events as verification-grade events.
+		if o.cfg.PIDFilter > 0 && int32(raw.Pid) == o.cfg.PIDFilter {
+			continue
+		}
 
 		var actionType models.ActionType
 		switch raw.Kind {
@@ -213,11 +246,6 @@ func (o *Observer) readLoop() {
 		default:
 			continue
 		}
-
-		if o.cfg.PIDFilter > 0 && int32(raw.Pid) != o.cfg.PIDFilter {
-			continue
-		}
-
 		target := commandLine(raw.Args[:], raw.Nargs)
 		if target == "" {
 			continue
@@ -226,10 +254,12 @@ func (o *Observer) readLoop() {
 			continue
 		}
 
+		isTopLevel := raw.IsToplevel == 1
 		event := models.GroundTruthEvent{
 			Timestamp:  time.Unix(0, raw.TsNs+o.bootOffsetNs),
 			ActionType: actionType,
 			Target:     target,
+			IsTopLevel: &isTopLevel,
 		}
 		if raw.HasExitCode != 0 {
 			code := raw.ExitCode
@@ -273,4 +303,22 @@ func cString(b []int8) string {
 		buf = append(buf, byte(c))
 	}
 	return string(buf)
+}
+
+// SetRootPID configures the probe to only track this process and its descendants.
+// It also clears the CommandFilter if any, since ancestry tracking replaces it.
+func (o *Observer) SetRootPID(pid int32) error {
+	zero := uint32(0)
+	one := uint8(1)
+	if err := o.objs.ConfigMap.Update(&zero, &one, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update config_map: %w", err)
+	}
+	p := uint32(pid)
+	info := bpfProcInfo{IsShell: 1}
+	if err := o.objs.TrackedPids.Update(&p, &info, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update tracked_pids: %w", err)
+	}
+	o.cfg.PIDFilter = pid
+	o.cfg.CommandFilter = ""
+	return nil
 }

@@ -96,12 +96,13 @@ func main() {
 	// Skipped under --file-only: Tier 1 runs no process probe, so these
 	// entries would have no ground truth to corroborate them.
 	if !fileOnly {
+		// Tier 2.5 Semantic Gap test: agent executes a shell command (top-level)
+		// which spawns a subprocess (forensic).
 		wcArgs := []string{"wc", "-l", f2}
 		wcCmdLine := strings.Join(wcArgs, " ")
 		addEntry(models.ProcessExec, wcCmdLine)
-		// wc opens f2 for reading. FAN_OPEN fires for any open regardless of
-		// mode, so the fs probe observes this too -- report it or that event
-		// goes Unrecorded even though the trajectory is otherwise honest.
+		// wc opens f2 for reading. Since fanotify tracks all file events,
+		// report it so it doesn't cause an omission mismatch.
 		addEntry(models.FileOpen, f2)
 		wcCmd := exec.Command(wcArgs[0], wcArgs[1:]...)
 		runErr := wcCmd.Run()

@@ -50,8 +50,37 @@ struct event {
 	__s64 ts_ns;         // bpf_ktime_get_ns() at exec, or at exit for KIND_EXIT
 	__s32 exit_code;     // valid only if has_exit_code is set
 	__u8  has_exit_code;
+	__u8  is_toplevel;
 	char args[ARGS_BUF];
 };
+
+
+struct proc_info {
+	__u8 is_shell;
+	__u8 is_toplevel;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, __u32);
+	__type(value, struct proc_info);
+} tracked_pids SEC(".maps");
+
+// User space sets this to 1 if we are tracking a specific process tree (PIDFilter > 0).
+// If 0, we track everything system-wide and treat all as top-level.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u8);
+} config_map SEC(".maps");
+
+static __always_inline __u8 get_use_pid_filter() {
+	__u32 zero = 0;
+	__u8 *val = bpf_map_lookup_elem(&config_map, &zero);
+	return val ? *val : 0;
+}
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -104,6 +133,41 @@ struct sys_enter_exit_group_ctx {
 	__u64 error_code;
 };
 
+
+struct task_newtask_ctx {
+	__u64 pad;
+	__s32 pid;
+	char comm[16];
+	__u64 clone_flags;
+	__s16 oom_score_adj;
+};
+
+SEC("tracepoint/task/task_newtask")
+int handle_fork(struct task_newtask_ctx *ctx)
+{
+	if (!get_use_pid_filter())
+		return 0;
+
+	__u32 parent_pid = bpf_get_current_pid_tgid() >> 32;
+	__u32 child_pid = ctx->pid;
+
+	struct proc_info *p = bpf_map_lookup_elem(&tracked_pids, &parent_pid);
+	if (!p)
+		return 0;
+
+	struct proc_info child = {0};
+	// A direct child of the shell is a top-level command.
+	if (p->is_shell) {
+		child.is_toplevel = 1;
+	} else {
+		// Grandchildren are forensic-grade.
+		child.is_toplevel = 0;
+	}
+
+	bpf_map_update_elem(&tracked_pids, &child_pid, &child, BPF_ANY);
+	return 0;
+}
+
 SEC("tracepoint/syscalls/sys_enter_execve")
 int handle_execve(struct sys_enter_execve_ctx *ctx)
 {
@@ -116,6 +180,15 @@ int handle_execve(struct sys_enter_execve_ctx *ctx)
 
 	e->pid = pid;
 	e->kind = KIND_EXEC;
+	if (get_use_pid_filter()) {
+		struct proc_info *p = bpf_map_lookup_elem(&tracked_pids, &pid);
+		if (!p)
+			return 0;
+		e->is_toplevel = p->is_toplevel;
+	} else {
+		e->is_toplevel = 1;
+	}
+
 	e->ts_ns = bpf_ktime_get_ns();
 	e->exit_code = 0;
 	e->has_exit_code = 0;
@@ -199,6 +272,11 @@ int handle_exit(struct sched_process_exit_ctx *ctx)
 		e->ts_ns = bpf_ktime_get_ns(); // actual exit time, not the exec time
 		bpf_ringbuf_output(&events, e, sizeof(*e), 0);
 	}
+
 	bpf_map_delete_elem(&execs, &tgid);
+	if (get_use_pid_filter()) {
+		bpf_map_delete_elem(&tracked_pids, &tgid);
+	}
 	return 0;
+
 }

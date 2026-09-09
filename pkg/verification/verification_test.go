@@ -24,7 +24,7 @@ func te(offsetMs int, action models.ActionType, target string, in, out *string) 
 }
 
 func ge(offsetMs int, action models.ActionType, target string, in, out *string) models.GroundTruthEvent {
-	return models.GroundTruthEvent{
+	return models.GroundTruthEvent{IsTopLevel: bp(true),
 		Timestamp:  baseTime.Add(time.Duration(offsetMs) * time.Millisecond),
 		ActionType: action,
 		Target:     target,
@@ -34,6 +34,8 @@ func ge(offsetMs int, action models.ActionType, target string, in, out *string) 
 }
 
 func sp(s string) *string { return &s }
+
+func bp(b bool) *bool { return &b }
 
 // --- Unit tests for individual sets ---
 
@@ -110,6 +112,32 @@ func TestUnrecorded(t *testing.T) {
 	}
 }
 
+func TestDescendantGroundTruthIsIgnored(t *testing.T) {
+	ground := models.GroundTruth{
+		{IsTopLevel: bp(false), Timestamp: baseTime, ActionType: models.ProcessExec, Target: "helper"},
+	}
+
+	v := Verify(nil, ground, cfg)
+	if !v.Faithful {
+		t.Fatalf("descendant event should not affect verification: %+v", v)
+	}
+	if len(v.Unrecorded) != 0 {
+		t.Fatalf("expected no unrecorded descendant events, got %d", len(v.Unrecorded))
+	}
+}
+
+func TestLegacyGroundTruthDefaultsToTopLevel(t *testing.T) {
+	traj := models.Trajectory{te(0, models.FileRead, "/tmp/file", nil, nil)}
+	ground := models.GroundTruth{
+		{Timestamp: baseTime, ActionType: models.FileRead, Target: "/tmp/file"},
+	}
+
+	v := Verify(traj, ground, cfg)
+	if !v.Faithful || len(v.Corroborated) != 1 {
+		t.Fatalf("legacy event should remain verifiable: %+v", v)
+	}
+}
+
 func TestMismatched(t *testing.T) {
 	traj := models.Trajectory{
 		te(0, models.FileRead, "/etc/hostname", nil, sp("benign_hash")),
@@ -159,7 +187,7 @@ func TestExitCodeMismatch(t *testing.T) {
 		{Timestamp: baseTime, ActionType: models.ProcessExit, Target: "/usr/bin/git push", ExitCode: &claimedOK},
 	}
 	ground := models.GroundTruth{
-		{Timestamp: baseTime.Add(5 * time.Millisecond), ActionType: models.ProcessExit, Target: "/usr/bin/git push", ExitCode: &actualFailed},
+		{IsTopLevel: bp(true), Timestamp: baseTime.Add(5 * time.Millisecond), ActionType: models.ProcessExit, Target: "/usr/bin/git push", ExitCode: &actualFailed},
 	}
 
 	v := Verify(traj, ground, cfg)
@@ -184,7 +212,7 @@ func TestExitCodeNilTreatedAsAgreement(t *testing.T) {
 	ground := models.GroundTruth{
 		// Probe didn't capture an exit code (e.g. killed by an uncaught
 		// signal, never hit exit_group): should not be a mismatch.
-		{Timestamp: baseTime.Add(5 * time.Millisecond), ActionType: models.ProcessExit, Target: "/usr/bin/git push"},
+		{IsTopLevel: bp(true), Timestamp: baseTime.Add(5 * time.Millisecond), ActionType: models.ProcessExit, Target: "/usr/bin/git push"},
 	}
 
 	v := Verify(traj, ground, cfg)
