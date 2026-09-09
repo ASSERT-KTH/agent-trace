@@ -1,5 +1,5 @@
 # Ignore the planning, HTML, and research docs as requested
-docs/
+docs/plan/
 *.html
 
 # Ignore ephemeral agent state
