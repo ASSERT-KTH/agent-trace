@@ -246,7 +246,7 @@ func (o *Observer) readLoop() {
 		default:
 			continue
 		}
-		target := commandLine(raw.Args[:], raw.Nargs)
+		target := commandLine(cString(raw.Filename[:]), raw.Args[:], raw.Nargs)
 		if target == "" {
 			continue
 		}
@@ -274,21 +274,47 @@ func (o *Observer) readLoop() {
 	}
 }
 
-// commandLine rejoins the fixed-width argv slots written by the BPF program
-// into a single space-separated command line. nargs bounds how many slots the
-// probe populated; anything beyond it, or any empty slot, is skipped.
-func commandLine(args []int8, nargs uint32) string {
+// commandLine builds the ground-truth command identity for an exec/exit
+// event. The leading token is the kernel-resolved execve path (filename),
+// never argv[0]: a process can call execve() with any argv[0] it likes,
+// unrelated to the binary actually being loaded (process masquerading), so
+// argv[0] carries no evidentiary weight about what ran. The remaining
+// tokens are argv[1:], rejoined from the fixed-width slots the BPF program
+// wrote; argv[0] itself is dropped from the reported target since filename
+// already identifies the binary and keeping both would just reintroduce a
+// second, spoofable name for the same slot.
+//
+// If filename wasn't captured (e.g. the in-kernel read failed), this falls
+// back to argv[0] so the event isn't silently dropped, but that fallback
+// path carries the same caller-controlled-string weakness the filename read
+// exists to avoid; it should be rare in practice (filename capture failing
+// on a successful execve would itself be unusual).
+func commandLine(filename string, args []int8, nargs uint32) string {
 	slots := len(args) / argSlot
 	if n := int(nargs); n < slots {
 		slots = n
 	}
 
-	parts := make([]string, 0, slots)
+	argv := make([]string, 0, slots)
 	for i := 0; i < slots; i++ {
 		if s := cString(args[i*argSlot : (i+1)*argSlot]); s != "" {
-			parts = append(parts, s)
+			argv = append(argv, s)
 		}
 	}
+
+	cmd := filename
+	rest := argv
+	if cmd == "" {
+		if len(argv) == 0 {
+			return ""
+		}
+		cmd = argv[0]
+		rest = argv[1:]
+	} else if len(argv) > 0 {
+		rest = argv[1:]
+	}
+
+	parts := append([]string{cmd}, rest...)
 	return strings.Join(parts, " ")
 }
 

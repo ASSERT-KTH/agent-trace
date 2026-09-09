@@ -46,13 +46,47 @@ func targetsMatch(actionType models.ActionType, tTarget, gTarget string) bool {
 	}
 }
 
-// commandsMatch compares two command references for a process action. When one
-// side is a bare command name (no path separator) and the other is a path, they
-// match if the path's final element equals the bare name. This absorbs the
-// common case where the agent logs "ls" while an execve probe records
-// "/usr/bin/ls". The comparison is deterministic: it never consults the
+// commandsMatch compares two "command arg1 arg2 ..." references for a process
+// action. The command token (the part before the first space) is compared
+// separately from the argument tokens that follow it, because the command
+// token is the only part that gets bare-name/path normalization: when one
+// side's command token is a bare name (no path separator) and the other's is
+// a path, they match if the path's final element equals the bare name. This
+// absorbs the common case where the agent logs "wc -l file.txt" while an
+// execve probe reports "/usr/bin/wc -l file.txt" (see proc.commandLine,
+// which builds the ground-truth command token from the kernel-resolved
+// execve path rather than argv[0], precisely so this comparison is checking
+// the real binary and not a caller-supplied label for it). Argument tokens
+// always require an exact match; only the command token gets path leniency,
+// otherwise a fabricated argument could hide behind normalization meant for
+// binary names. The comparison is deterministic: it never consults the
 // verifier host's PATH or the filesystem.
 func commandsMatch(a, b string) bool {
+	if a == b {
+		return true
+	}
+
+	aCmd, aArgs := splitCommandLine(a)
+	bCmd, bArgs := splitCommandLine(b)
+
+	if aArgs != bArgs {
+		return false
+	}
+	return commandTokensMatch(aCmd, bCmd)
+}
+
+// splitCommandLine separates the leading command token from the rest of the
+// argument string.
+func splitCommandLine(s string) (cmd, args string) {
+	if i := strings.IndexByte(s, ' '); i >= 0 {
+		return s[:i], s[i+1:]
+	}
+	return s, ""
+}
+
+// commandTokensMatch compares two single command tokens (no arguments),
+// applying bare-name/path leniency as described in commandsMatch.
+func commandTokensMatch(a, b string) bool {
 	if a == b {
 		return true
 	}

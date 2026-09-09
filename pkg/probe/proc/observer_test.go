@@ -156,6 +156,79 @@ func TestObserver_ExitCodeAndTimestamps(t *testing.T) {
 	}
 }
 
+// TestObserver_ResistsArgv0Spoofing is the live-kernel counterpart to
+// TestCommandLine_UsesResolvedFilenameNotArgv0: it doesn't just check the
+// parsing helper in isolation, it spawns a real process that performs the
+// actual masquerading primitive (execve() with an argv[0] unrelated to the
+// binary being loaded) and confirms the probe's reported ground truth is
+// built from the kernel-resolved path, not the caller-supplied argv[0]. This
+// also confirms CommandFilter itself can't be evaded by argv[0] spoofing,
+// since it prefix-matches the same target string.
+func TestObserver_ResistsArgv0Spoofing(t *testing.T) {
+	skipUnprivileged(t)
+
+	nonce := fmt.Sprintf("agenttrace-spoof-%d", time.Now().UnixNano())
+
+	obs, err := New(Config{
+		CommandFilter: "/bin/true",
+		EventBufSize:  256,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	obs.Start()
+	time.Sleep(150 * time.Millisecond)
+
+	// Bypass exec.Command's LookPath convenience: set Path to the real
+	// binary directly but Args[0] to an unrelated, misleading name. This is
+	// exactly execve(real_path, {"fake_name", ...}, envp), the process
+	// masquerading primitive malware uses to disguise itself in ps/argv-based
+	// tooling.
+	//
+	// Deliberately /bin/true, not /bin/echo: on distros shipping uutils'
+	// Rust coreutils (this dev environment included), the coreutils
+	// binaries are a multicall dispatcher that itself checks argv[0]
+	// against the executable name and refuses to run on a mismatch
+	// ("Security violation: Requested utility ... does not match executable
+	// name"), which would make this test fail before the kernel probe is
+	// even exercised, for a reason unrelated to what's being tested. /bin/true
+	// here resolves to GNU coreutils' standalone `gnutrue` binary, which,
+	// like a typical statically-single-purpose binary, does not interpret
+	// argv[0] at all. Picking a test binary that itself dispatches on
+	// argv[0] would silently defeat the point of this test on such systems.
+	cmd := &exec.Cmd{
+		Path: "/bin/true",
+		Args: []string{"totally-not-true", nonce},
+	}
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("spawn spoofed-argv0 true: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if err := obs.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	got := collect(obs)
+
+	var found bool
+	for _, e := range got {
+		if !strings.Contains(e.Target, nonce) {
+			continue
+		}
+		found = true
+		if strings.HasPrefix(e.Target, "totally-not-true") {
+			t.Errorf("ground truth trusted the spoofed argv[0]: target=%q", e.Target)
+		}
+		if !strings.HasPrefix(e.Target, "/bin/true") {
+			t.Errorf("expected target built from the resolved execve path /bin/true, got %q", e.Target)
+		}
+	}
+	if !found {
+		t.Fatalf("no event observed for the spoofed-argv0 process; got %d events: %v", len(got), got)
+	}
+}
+
 func TestObserver_CommandFilterExcludesOthers(t *testing.T) {
 	skipUnprivileged(t)
 

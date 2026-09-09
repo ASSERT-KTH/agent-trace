@@ -23,6 +23,7 @@ type bpfEvent struct {
 	ExitCode    int32
 	HasExitCode uint8
 	IsToplevel  uint8
+	Filename    [256]int8
 	Args        [1536]int8
 	_           [2]byte
 }

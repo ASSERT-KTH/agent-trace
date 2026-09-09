@@ -424,6 +424,49 @@ func TestE2E_T3_Substitution(t *testing.T) {
 	}
 }
 
+// T3 attack, process-identity variant: the agent's trajectory claims it ran
+// a trusted system binary, but the process it actually ran resolves to a
+// different path (e.g. a planted binary earlier in PATH, or a directly
+// invoked execve() with a spoofed argv[0]). This is the scenario proc.
+// commandLine's move from argv[0] to the kernel-resolved execve filename
+// exists to make visible: the ground-truth target below is what the fixed
+// probe reports for such a run (see proc.TestCommandLine_UsesResolvedFilenameNotArgv0
+// and matching.TestProcessCommandWithArguments for the layers underneath).
+// Because the claimed and actual binaries are different resolved paths,
+// commandsMatch refuses the match (no basename fallback applies across
+// different directories), so this surfaces as Unwitnessed + Unrecorded
+// rather than Mismatched, the same occurrence-level pattern the Tier 1
+// filename-swap test documents for file actions.
+func TestE2E_T3_ProcessMasquerading(t *testing.T) {
+	traj := models.Trajectory{
+		te(0, models.ProcessExec, "/usr/bin/ls -la /workspace", nil, nil),
+	}
+	ground := models.GroundTruth{
+		ge(5, models.ProcessExec, "/tmp/attacker-writable-dir/ls -la /workspace", nil, nil),
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if v.Faithful {
+		t.Error("process masquerading should be NOT FAITHFUL")
+	}
+	if len(v.Unwitnessed) != 1 {
+		t.Fatalf("expected 1 unwitnessed (claimed binary never ran), got %d", len(v.Unwitnessed))
+	}
+	if v.Unwitnessed[0].Target != "/usr/bin/ls -la /workspace" {
+		t.Errorf("wrong unwitnessed target: %s", v.Unwitnessed[0].Target)
+	}
+	if len(v.Unrecorded) != 1 {
+		t.Fatalf("expected 1 unrecorded (the binary that actually ran), got %d", len(v.Unrecorded))
+	}
+	if v.Unrecorded[0].Target != "/tmp/attacker-writable-dir/ls -la /workspace" {
+		t.Errorf("wrong unrecorded target: %s", v.Unrecorded[0].Target)
+	}
+	if len(v.Corroborated) != 0 {
+		t.Errorf("expected 0 corroborated, got %d", len(v.Corroborated))
+	}
+}
+
 // Combined attack: omission + fabrication + substitution in the same trajectory.
 func TestE2E_CombinedAttack(t *testing.T) {
 	traj, ground := honestTrajectory()

@@ -39,10 +39,19 @@ char LICENSE[] SEC("license") = "GPL";
 #define ARG_SLOT 128                    // max bytes per argv entry, including NUL
 #define MAX_ARGS 12                     // argv entries captured
 #define ARGS_BUF (MAX_ARGS * ARG_SLOT)  // total argv bytes carried per event
+#define FILENAME_LEN 256                // max bytes for the resolved execve path
 
 #define KIND_EXEC 0
 #define KIND_EXIT 1
 
+// struct event carries both `filename` and `args`. `filename` is the path
+// the kernel actually resolved and loaded (ctx->filename on sys_enter_execve),
+// independent of whatever the caller chose to put in argv. `args` still
+// carries argv, including argv[0], for display/forensics, but argv[0] must
+// never be trusted as the process's identity: a caller can execve() a binary
+// while passing an arbitrary, unrelated argv[0] (classic process
+// masquerading), so userspace builds the reported command identity from
+// `filename`, not from args[0]. See commandLine() in observer.go.
 struct event {
 	__u32 pid;
 	__u32 kind;
@@ -51,6 +60,7 @@ struct event {
 	__s32 exit_code;     // valid only if has_exit_code is set
 	__u8  has_exit_code;
 	__u8  is_toplevel;
+	char filename[FILENAME_LEN]; // resolved execve path; kernel-observed, not caller-supplied
 	char args[ARGS_BUF];
 };
 
@@ -192,6 +202,11 @@ int handle_execve(struct sys_enter_execve_ctx *ctx)
 	e->ts_ns = bpf_ktime_get_ns();
 	e->exit_code = 0;
 	e->has_exit_code = 0;
+
+	// Read the kernel-resolved path directly, not from argv. This is the
+	// field the verifier trusts as the process's real identity.
+	e->filename[0] = '\0';
+	bpf_probe_read_user_str(&e->filename, sizeof(e->filename), ctx->filename);
 
 	__u32 nargs = 0;
 	int done = 0;

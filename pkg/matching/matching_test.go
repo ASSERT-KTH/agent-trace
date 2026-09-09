@@ -203,6 +203,70 @@ func TestProcessCommandNormalization(t *testing.T) {
 	}
 }
 
+func TestProcessCommandWithArguments(t *testing.T) {
+	cfg := DefaultConfig()
+
+	tests := []struct {
+		name    string
+		tTarget string
+		gTarget string
+		want    bool
+	}{
+		{
+			// The common honest case post-fix: the agent reports the bare
+			// command it invoked, the process probe reports the
+			// kernel-resolved path, and both carry the same arguments
+			// (which now contain a path themselves, the case the old
+			// whole-string bare/path check got wrong).
+			name:    "bare command with path argument vs resolved path",
+			tTarget: "wc -l /tmp/workspace/file2.txt",
+			gTarget: "/usr/bin/wc -l /tmp/workspace/file2.txt",
+			want:    true,
+		},
+		{
+			name:    "identical bare command and arguments",
+			tTarget: "git commit -m fix",
+			gTarget: "git commit -m fix",
+			want:    true,
+		},
+		{
+			name:    "same command, different arguments do not match",
+			tTarget: "wc -l /tmp/workspace/file1.txt",
+			gTarget: "/usr/bin/wc -l /tmp/workspace/file2.txt",
+			want:    false,
+		},
+		{
+			name:    "same arguments, different resolved command do not match",
+			tTarget: "wc -l /tmp/workspace/file2.txt",
+			gTarget: "/usr/bin/cat -l /tmp/workspace/file2.txt",
+			want:    false,
+		},
+		{
+			// The anti-spoofing case this change exists for: the agent
+			// claims a fully-qualified, trusted binary, but the process
+			// probe (once it reports the real execve path instead of
+			// argv[0], see proc.commandLine) shows a different binary
+			// actually ran. This must NOT be treated as a match just
+			// because both sides share the same trailing arguments.
+			name:    "claimed trusted path vs actually-resolved different path",
+			tTarget: "/usr/bin/ls -la /tmp/workspace",
+			gTarget: "/tmp/attacker-writable-dir/ls -la /tmp/workspace",
+			want:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			te := entry(0, models.ProcessExec, tc.tTarget)
+			ge := event(0, models.ProcessExec, tc.gTarget)
+			got := Match(te, ge, cfg)
+			if got != tc.want {
+				t.Errorf("Match(%q, %q) = %v, want %v", tc.tTarget, tc.gTarget, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProcessExitUsesCommandNormalization(t *testing.T) {
 	cfg := DefaultConfig()
 	te := entry(0, models.ProcessExit, "make")
