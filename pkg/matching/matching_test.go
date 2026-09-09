@@ -267,6 +267,70 @@ func TestProcessCommandWithArguments(t *testing.T) {
 	}
 }
 
+func TestBareCommandRequiresTrustedDirectory(t *testing.T) {
+	cfg := DefaultConfig()
+
+	tests := []struct {
+		name    string
+		tTarget string
+		gTarget string
+		want    bool
+	}{
+		{
+			// The legitimate convenience case: bare claim, standard
+			// system path. Still matches.
+			name:    "bare name vs allowlisted /usr/bin path",
+			tTarget: "ls",
+			gTarget: "/usr/bin/ls",
+			want:    true,
+		},
+		{
+			// The actual fix. Pre-Fix-2 the basename match alone made this
+			// true, letting a planted binary in an agent-writable directory
+			// corroborate a bare-name claim for a common tool.
+			name:    "bare name vs non-allowlisted, often-writable path",
+			tTarget: "ls",
+			gTarget: "/tmp/attacker-writable-dir/ls",
+			want:    false,
+		},
+		{
+			// Intentional stricter stance (spec Fix 2): a bare claim can no
+			// longer vouch for a virtualenv/pyenv-style interpreter path,
+			// only for system-standard locations. If this proves too strict
+			// for real target agents, widen trustedBinDirs deliberately.
+			name:    "bare name vs venv interpreter path",
+			tTarget: "python",
+			gTarget: "/opt/venv/bin/python",
+			want:    false,
+		},
+		{
+			name:    "bare name vs allowlisted /usr/local/bin path",
+			tTarget: "node",
+			gTarget: "/usr/local/bin/node",
+			want:    true,
+		},
+		{
+			// Direction is symmetric: the resolved path may be on either
+			// side of the comparison.
+			name:    "non-allowlisted path vs bare name (reversed order)",
+			tTarget: "/home/agent/build/mytool",
+			gTarget: "mytool",
+			want:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			te := entry(0, models.ProcessExec, tc.tTarget)
+			ge := event(0, models.ProcessExec, tc.gTarget)
+			got := Match(te, ge, cfg)
+			if got != tc.want {
+				t.Errorf("Match(%q, %q) = %v, want %v", tc.tTarget, tc.gTarget, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProcessExitUsesCommandNormalization(t *testing.T) {
 	cfg := DefaultConfig()
 	te := entry(0, models.ProcessExit, "make")
