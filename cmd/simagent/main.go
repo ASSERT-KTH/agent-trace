@@ -5,7 +5,9 @@ import (
 	"flag"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/agent-trace/agent-trace/pkg/models"
@@ -14,9 +16,11 @@ import (
 func main() {
 	var workspace string
 	var trajectoryOut string
+	var dropEntry int
 
 	flag.StringVar(&workspace, "workspace", "", "Path to the workspace directory")
 	flag.StringVar(&trajectoryOut, "trajectory-out", "", "Path to write the trajectory JSON")
+	flag.IntVar(&dropEntry, "drop-entry", -1, "Zero-based index of a trajectory entry to omit before writing (simulates an omission attack for manual testing; -1 disables)")
 	flag.Parse()
 
 	if workspace == "" || trajectoryOut == "" {
@@ -71,7 +75,37 @@ func main() {
 
 	delay()
 
-	// 3. Delete
+	// 3. Exec (Tier 2): the agent double-checks its edit by running "wc -l"
+	// against the renamed file, like a real coding agent verifying a change.
+	// We report the exact argv the kernel will see: os/exec passes argv[0] as
+	// given ("wc"), not the PATH-resolved absolute path, so the process
+	// probe's reconstructed command line matches this string byte-for-byte.
+	wcArgs := []string{"wc", "-l", f2}
+	wcCmdLine := strings.Join(wcArgs, " ")
+	addEntry(models.ProcessExec, wcCmdLine)
+	// wc opens f2 for reading. FAN_OPEN fires for any open regardless of
+	// mode, so the fs probe observes this too -- report it or that event
+	// goes Unrecorded even though the trajectory is otherwise honest.
+	addEntry(models.FileOpen, f2)
+	wcCmd := exec.Command(wcArgs[0], wcArgs[1:]...)
+	runErr := wcCmd.Run()
+	if _, ok := runErr.(*exec.ExitError); runErr != nil && !ok {
+		log.Fatalf("failed to run wc: %v", runErr)
+	}
+	var wcExitCode int32
+	if wcCmd.ProcessState != nil {
+		wcExitCode = int32(wcCmd.ProcessState.ExitCode())
+	}
+	trajectory = append(trajectory, models.TrajectoryEntry{
+		Timestamp:  time.Now(),
+		ActionType: models.ProcessExit,
+		Target:     wcCmdLine,
+		ExitCode:   &wcExitCode,
+	})
+
+	delay()
+
+	// 4. Delete
 	// os.Remove triggers:
 	// - FAN_DELETE (FileDelete)
 	// Note: on tmpfs, this might report the parent dir in DFID, but we use TempDir
@@ -80,6 +114,10 @@ func main() {
 	err = os.Remove(f2)
 	if err != nil {
 		log.Fatalf("failed to remove file: %v", err)
+	}
+
+	if dropEntry >= 0 && dropEntry < len(trajectory) {
+		trajectory = append(trajectory[:dropEntry], trajectory[dropEntry+1:]...)
 	}
 
 	b, err := json.MarshalIndent(trajectory, "", "  ")

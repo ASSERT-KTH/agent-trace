@@ -10,6 +10,15 @@ STATE.md
 *.out
 /cmd/simagent/simagent
 
+# Live-demo binaries (README "Live demo" section builds these at repo root)
+/watch
+/simagent
+/verify
+
+# Live-demo output (trajectory + ground truth JSON written by the demo)
+/trajectory.json
+/ground_truth.json
+
 # OS / Editor specifics
 .DS_Store
 .idea/

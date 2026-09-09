@@ -35,12 +35,19 @@ Tiers 3-6 (network probes, content hashing, and attack simulation) are planned b
 pkg/models        Shared types: TrajectoryEntry, GroundTruthEvent, ActionType
 pkg/matching      Action matching rules, including command-path normalization
 pkg/verification  Trajectory-vs-ground-truth comparison and verdict classification
+pkg/probe         Observer interface every probe implements (used by cmd/watch)
 pkg/probe/fs      Tier 1 filesystem observer (fanotify)
 pkg/probe/proc    Tier 2 process observer (eBPF: execve, exit_group, sched_process_exit)
 cmd/simagent      Simulated agent that performs real filesystem/process actions and
                   emits a matching trajectory, for exercising the probes end to end
+cmd/watch         Ground-truth recorder CLI: runs the requested probes live, prints
+                  events as they're captured, writes ground truth JSON on exit
+cmd/verify        Verification-engine CLI: compares a trajectory and a ground truth
+                  JSON and prints the FAITHFUL / NOT FAITHFUL verdict
 tests/e2e         End-to-end scenarios wiring simagent + probes + verification together
 ```
+
+`cmd/watch`, `cmd/simagent`, and `cmd/verify` map directly onto the three components in the architecture design (`docs/plan/01_protocol_architecture.md`): ground-truth recorder, the thing being observed, and verification engine + reporting layer.
 
 ## Requirements
 
@@ -67,6 +74,43 @@ Without root, the filesystem, process, and end-to-end tests skip rather than fai
 sudo go test -v ./...
 ```
 
+## Live demo
+
+Beyond the automated tests, `watch` + `simagent` + `verify` let you run every implemented tier interactively across two terminals — a probe watching live in one, a simulated agent acting in the other — instead of only reading assertions in test output. Build all three first:
+
+```sh
+go build -o watch    ./cmd/watch
+go build -o simagent ./cmd/simagent
+go build -o verify   ./cmd/verify
+```
+
+**Terminal A** — start the ground-truth recorder on a scratch workspace (requires root: fanotify + eBPF):
+
+```sh
+mkdir -p /tmp/agent-trace-demo
+sudo ./watch --workspace /tmp/agent-trace-demo --proc-filter wc --out ground_truth.json
+```
+
+It prints each file and process event as it's captured. `--proc-filter wc` scopes the process probe to the `wc` command `simagent` runs below, so unrelated processes on the machine don't pollute the ground truth.
+
+**Terminal B** — run the simulated agent against the same workspace:
+
+```sh
+./simagent --workspace /tmp/agent-trace-demo --trajectory-out trajectory.json
+```
+
+It writes a file, renames it, runs `wc -l` on it, then deletes it — exercising the Tier 1 filesystem probe, the Tier 2 process probe, and the mixed file+process verification together.
+
+Back in **terminal A**, press Ctrl+C once `simagent` finishes. `watch` writes `ground_truth.json` and exits. Then, in either terminal:
+
+```sh
+./verify --trajectory trajectory.json --ground-truth ground_truth.json
+```
+
+This prints a FAITHFUL verdict with a per-category breakdown. To see the NOT FAITHFUL path, rerun `simagent` with `--drop-entry 0` (or any valid index) to omit a self-reported action before it's written out, then `verify` again — `Unrecorded` will be non-empty and the verdict flips.
+
+This harness is meant to grow with the project: `pkg/probe.Observer` is the interface every probe implements, and `cmd/watch`'s `probeBuilders` map is a single-entry extension point, so adding Tier 3's network probe (once it exists) means adding one build function, not a new tool.
+
 ## Project status
 
-This is a research prototype under active development. Tiers 0-2 are implemented and tested; Tiers 3-6 are not yet built. There is no standalone verifier CLI yet — the pipeline (simulated agent, probes, and verification) is currently exercised through the end-to-end tests in `tests/e2e` and the `simagent` binary in `cmd/simagent`.
+This is a research prototype under active development. Tiers 0-2 are implemented and tested; Tiers 3-6 are not yet built.
