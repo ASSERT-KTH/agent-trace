@@ -86,28 +86,23 @@ go build -o simagent ./cmd/simagent
 go build -o verify   ./cmd/verify
 ```
 
-**Terminal A** — start the ground-truth recorder on a scratch workspace (requires root: fanotify + eBPF):
+Start the ground-truth recorder on a scratch workspace and let it launch the agent (requires root: fanotify + eBPF):
 
 ```sh
 mkdir -p /tmp/agent-trace-demo
-sudo ./watch --workspace /tmp/agent-trace-demo --proc-filter wc --out ground_truth.json
+sudo ./watch --workspace /tmp/agent-trace-demo --out ground_truth.json -- \
+	./simagent --workspace /tmp/agent-trace-demo --trajectory-out trajectory.json
 ```
 
-It prints each file and process event as it's captured. `--proc-filter wc` scopes the process probe to the `wc` command `simagent` runs below, so unrelated processes on the machine don't pollute the ground truth.
+With a trailing `-- <command>`, `watch` starts the command itself, records its PID as the process probe's ancestry root (so the agent's own exec is suppressed and only its descendants count as agent actions), prints each file and process event as it's captured, runs the agent to completion, then writes `ground_truth.json` and exits. No `--proc-filter` needed: ancestry scoping replaces it.
 
-**Terminal B** — run the simulated agent against the same workspace:
-
-```sh
-./simagent --workspace /tmp/agent-trace-demo --trajectory-out trajectory.json
-```
-
-It writes a file, renames it, runs `wc -l` on it, then deletes it — exercising the Tier 1 filesystem probe, the Tier 2 process probe, and the mixed file+process verification together.
-
-Back in **terminal A**, press Ctrl+C once `simagent` finishes. `watch` writes `ground_truth.json` and exits. Then, in either terminal:
+`simagent` writes a file, renames it, runs `wc -l` on it, then deletes it — exercising the Tier 1 filesystem probe, the Tier 2 process probe, and the mixed file+process verification together. Then:
 
 ```sh
 ./verify --trajectory trajectory.json --ground-truth ground_truth.json
 ```
+
+To watch an agent `watch` cannot be the parent of (e.g. a container entrypoint), start it separately and pass `--root-pid N` instead of a `-- <command>`; `watch` then records until Ctrl+C. This mode has an uncloseable race: anything that PID did before `--root-pid` was applied is invisible to the process probe (the fs probe, which is not ancestry-scoped, still sees it).
 
 This prints a FAITHFUL verdict with a per-category breakdown. To see the NOT FAITHFUL path, rerun `simagent` with `--drop-entry 0` (or any valid index) to omit a self-reported action before it's written out, then `verify` again — `Unrecorded` will be non-empty and the verdict flips.
 
