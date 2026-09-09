@@ -28,6 +28,13 @@ func isTopLevel(event models.GroundTruthEvent) bool {
 // hashesAgree compares two optional hashes. If either side is nil (content
 // not captured), we cannot disprove the claim, so we treat it as agreement.
 // A mismatch requires both sides to have a non-nil, different value.
+//
+// NOTE: Verify applies a stricter override on top of this for specific
+// action types. For a FileClose entry whose OutputHash is nil while the
+// ground truth captured one, the nil is the agent opting out of a check it
+// could have passed, not a probe gap, and Verify forces a mismatch. This
+// function's permissive rule still governs every other case (any nil on the
+// ground-truth side, and InputHash until Tier 4.2 lands on both sides).
 func hashesAgree(a, b *string) bool {
 	if a == nil || b == nil {
 		return true
@@ -40,6 +47,10 @@ func hashesAgree(a, b *string) bool {
 // cannot disprove the claim. A mismatch requires both sides to report a
 // code and for those codes to differ -- e.g. the agent claims a command
 // succeeded while the ground truth shows it exited nonzero.
+//
+// NOTE: as with hashesAgree, Verify overrides this for a ProcessExit entry
+// whose ExitCode is nil while the ground truth captured one -- that reads as
+// the agent declining to report a value the probe has, not a probe gap.
 func exitCodesAgree(a, b *int32) bool {
 	if a == nil || b == nil {
 		return true
@@ -90,6 +101,24 @@ func Verify(t models.Trajectory, g models.GroundTruth, cfg matching.Config) Verd
 		inputOK := hashesAgree(entry.InputHash, g[bestIdx].InputHash)
 		outputOK := hashesAgree(entry.OutputHash, g[bestIdx].OutputHash)
 		exitOK := exitCodesAgree(entry.ExitCode, g[bestIdx].ExitCode)
+
+		// The general nil-agreement rule above is correct when the ground
+		// truth side is nil (the probe couldn't capture it, benefit of the
+		// doubt goes to a probe limitation). It must not extend to the
+		// agent's own trajectory choosing not to report a value the ground
+		// truth actually captured: that is the agent opting out of a check,
+		// not a probe gap, and must not read as agreement. Scoped to the two
+		// fields with complete round-trip support today (OutputHash on
+		// FileClose, ExitCode on ProcessExit); do not extend this to
+		// InputHash until Tier 4.2 implements it on both sides.
+		if entry.ActionType == models.FileClose &&
+			entry.OutputHash == nil && g[bestIdx].OutputHash != nil {
+			outputOK = false
+		}
+		if entry.ActionType == models.ProcessExit &&
+			entry.ExitCode == nil && g[bestIdx].ExitCode != nil {
+			exitOK = false
+		}
 
 		if inputOK && outputOK && exitOK {
 			v.Corroborated = append(v.Corroborated, pair)

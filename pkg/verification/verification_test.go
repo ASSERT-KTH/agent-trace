@@ -225,6 +225,114 @@ func TestExitCodeNilTreatedAsAgreement(t *testing.T) {
 	}
 }
 
+func ip(n int32) *int32 { return &n }
+
+// Fix 4: a FileClose entry that omits OutputHash while the ground truth
+// captured one is the agent opting out of a content check, not a probe gap.
+// It must surface as Mismatched, not Corroborated.
+func TestOmittedOutputHashOnFileCloseIsMismatched(t *testing.T) {
+	traj := models.Trajectory{
+		te(0, models.FileClose, "/workspace/out.txt", nil, nil),
+	}
+	ground := models.GroundTruth{
+		ge(5, models.FileClose, "/workspace/out.txt", nil, sp("real_hash")),
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if v.Faithful {
+		t.Error("omitted OutputHash on FileClose should be NOT FAITHFUL")
+	}
+	if len(v.Mismatched) != 1 {
+		t.Fatalf("expected 1 mismatched, got %d", len(v.Mismatched))
+	}
+	if v.Mismatched[0].Entry.OutputHash != nil {
+		t.Errorf("entry OutputHash should stay nil in the report, got %q",
+			*v.Mismatched[0].Entry.OutputHash)
+	}
+	if v.Mismatched[0].Event.OutputHash == nil || *v.Mismatched[0].Event.OutputHash != "real_hash" {
+		t.Errorf("event OutputHash should show what the probe captured, got %v",
+			v.Mismatched[0].Event.OutputHash)
+	}
+	if len(v.Corroborated) != 0 {
+		t.Errorf("expected 0 corroborated, got %d", len(v.Corroborated))
+	}
+}
+
+// Fix 4: same rule for a ProcessExit entry that omits ExitCode while the
+// ground truth captured one.
+func TestOmittedExitCodeOnProcessExitIsMismatched(t *testing.T) {
+	traj := models.Trajectory{
+		te(0, models.ProcessExit, "/usr/bin/git push", nil, nil),
+	}
+	ground := models.GroundTruth{
+		{IsTopLevel: bp(true), Timestamp: baseTime.Add(5 * time.Millisecond),
+			ActionType: models.ProcessExit, Target: "/usr/bin/git push", ExitCode: ip(1)},
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if v.Faithful {
+		t.Error("omitted ExitCode on ProcessExit should be NOT FAITHFUL")
+	}
+	if len(v.Mismatched) != 1 {
+		t.Fatalf("expected 1 mismatched, got %d", len(v.Mismatched))
+	}
+	if v.Mismatched[0].Entry.ExitCode != nil {
+		t.Errorf("entry ExitCode should stay nil in the report, got %d",
+			*v.Mismatched[0].Entry.ExitCode)
+	}
+	if v.Mismatched[0].Event.ExitCode == nil || *v.Mismatched[0].Event.ExitCode != 1 {
+		t.Errorf("event ExitCode should show what the probe captured, got %v",
+			v.Mismatched[0].Event.ExitCode)
+	}
+}
+
+// Fix 4 regression guard: the permissive default is deliberately kept for
+// the ground-truth-side nil (the probe genuinely couldn't capture it). This
+// duplicates TestHashNilTreatedAsAgreement's intent, kept next to the new
+// tests as an explicit "did the override flip the wrong direction" check.
+func TestGroundTruthNilHashStillTreatedAsAgreement(t *testing.T) {
+	traj := models.Trajectory{
+		te(0, models.FileClose, "/workspace/out.txt", nil, sp("agent_hash")),
+	}
+	ground := models.GroundTruth{
+		ge(5, models.FileClose, "/workspace/out.txt", nil, nil),
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if !v.Faithful {
+		t.Error("nil ground-truth hash must still be treated as agreement")
+	}
+	if len(v.Corroborated) != 1 {
+		t.Errorf("expected 1 corroborated, got %d", len(v.Corroborated))
+	}
+}
+
+// Fix 4 scope boundary: InputHash is deliberately NOT covered by the
+// override yet (Tier 4.2 capture isn't implemented on either side). A
+// trajectory omitting InputHash while the ground truth has one must still be
+// treated as agreement. This fails loudly if someone extends the override
+// to InputHash without building the Tier 4.2 capture path.
+func TestOmittedInputHashStillTreatedAsAgreement(t *testing.T) {
+	traj := models.Trajectory{
+		te(0, models.FileClose, "/workspace/out.txt", nil, sp("out_h")),
+	}
+	ground := models.GroundTruth{
+		ge(5, models.FileClose, "/workspace/out.txt", sp("in_h"), sp("out_h")),
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if !v.Faithful {
+		t.Error("omitted InputHash must still be treated as agreement until Tier 4.2")
+	}
+	if len(v.Corroborated) != 1 {
+		t.Errorf("expected 1 corroborated, got %d", len(v.Corroborated))
+	}
+}
+
 func TestEmptyTrajectoryAndGroundTruth(t *testing.T) {
 	v := Verify(nil, nil, cfg)
 
@@ -548,5 +656,51 @@ func TestE2E_CombinedAttack(t *testing.T) {
 	}
 	if len(v.Mismatched) != 1 {
 		t.Errorf("expected 1 mismatched (substituted file write), got %d", len(v.Mismatched))
+	}
+}
+
+// Fix 4 combined scenario: an omission (T1), a fabrication (T2), and two
+// check opt-outs in the same trajectory -- a FileClose with no OutputHash
+// and a ProcessExit with no ExitCode, both against ground truth that did
+// capture those values. All four must surface; none may launder into
+// Corroborated.
+func TestE2E_CombinedAttackWithOmittedEvidence(t *testing.T) {
+	traj := models.Trajectory{
+		te(0, models.FileRead, "/workspace/config.yaml", nil, sp("cfg_h")),
+		te(1000, models.NetRequest, "https://api.openai.com/v1/chat", sp("req_h"), sp("resp_h")),
+		te(2000, models.FileClose, "/workspace/output.txt", nil, nil),
+		{Timestamp: baseTime.Add(3000 * time.Millisecond), ActionType: models.ProcessExit,
+			Target: "/usr/bin/git push"},
+	}
+	ground := models.GroundTruth{
+		ge(2, models.FileRead, "/workspace/config.yaml", nil, sp("cfg_h")),
+		ge(1003, models.NetRequest, "https://api.openai.com/v1/chat", sp("req_h"), sp("resp_h")),
+		ge(2001, models.FileClose, "/workspace/output.txt", nil, sp("real_out_h")),
+		{IsTopLevel: bp(true), Timestamp: baseTime.Add(3004 * time.Millisecond),
+			ActionType: models.ProcessExit, Target: "/usr/bin/git push", ExitCode: ip(128)},
+		ge(4000, models.FileRead, "/workspace/secret.env", nil, sp("secret_h")),
+	}
+
+	// T2: agent fabricates a benign read that never happened.
+	traj = append(traj, te(3500, models.FileRead, "/workspace/README.md", nil, sp("readme_h")))
+
+	v := Verify(traj, ground, cfg)
+
+	if v.Faithful {
+		t.Error("combined attack should be NOT FAITHFUL")
+	}
+	if len(v.Unrecorded) != 1 || v.Unrecorded[0].Target != "/workspace/secret.env" {
+		t.Errorf("expected 1 unrecorded (omitted secret read), got %+v", v.Unrecorded)
+	}
+	if len(v.Unwitnessed) != 1 || v.Unwitnessed[0].Target != "/workspace/README.md" {
+		t.Errorf("expected 1 unwitnessed (fabricated README read), got %+v", v.Unwitnessed)
+	}
+	if len(v.Mismatched) != 2 {
+		t.Errorf("expected 2 mismatched (omitted OutputHash + omitted ExitCode), got %d",
+			len(v.Mismatched))
+	}
+	if len(v.Corroborated) != 2 {
+		t.Errorf("expected 2 corroborated (config read + net request), got %d",
+			len(v.Corroborated))
 	}
 }
