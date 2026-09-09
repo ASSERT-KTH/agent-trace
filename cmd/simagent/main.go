@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-trace/agent-trace/pkg/content"
 	"github.com/agent-trace/agent-trace/pkg/models"
 )
 
@@ -38,6 +39,14 @@ func main() {
 			Target:     target,
 		})
 	}
+	addEntryWithOutputHash := func(action models.ActionType, target, outputHash string) {
+		trajectory = append(trajectory, models.TrajectoryEntry{
+			Timestamp:  time.Now(),
+			ActionType: action,
+			Target:     target,
+			OutputHash: &outputHash,
+		})
+	}
 
 	// Wait slightly between operations so timestamps are strictly ordered and matched properly
 	delay := func() {
@@ -56,11 +65,13 @@ func main() {
 	addEntry(models.FileOpen, f1)
 	addEntry(models.FileWrite, f1) // create
 	addEntry(models.FileWrite, f1) // modify
-	addEntry(models.FileClose, f1)
-	err := os.WriteFile(f1, []byte("hello"), 0644)
+	fileContents := []byte("hello")
+	err := os.WriteFile(f1, fileContents, 0644)
 	if err != nil {
 		log.Fatalf("failed to write file: %v", err)
 	}
+	fileHash := content.SHA256Bytes(fileContents)
+	addEntryWithOutputHash(models.FileClose, f1, fileHash)
 
 	delay()
 

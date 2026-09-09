@@ -2,11 +2,14 @@ package fs
 
 import (
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 
+	"github.com/agent-trace/agent-trace/pkg/content"
 	"github.com/agent-trace/agent-trace/pkg/models"
 )
 
@@ -50,6 +53,9 @@ type Observer struct {
 	stopped    chan struct{}
 	cfg        Config
 	overflow   bool // true if FAN_Q_OVERFLOW was seen
+	pendingHashOpens map[string]int
+	mu               sync.Mutex
+	wg               sync.WaitGroup
 }
 
 // New creates an Observer. The caller must call Start to begin receiving
@@ -94,6 +100,7 @@ func New(cfg Config) (*Observer, error) {
 		events:     make(chan models.GroundTruthEvent, cfg.EventBufSize),
 		stopped:    make(chan struct{}),
 		cfg:        cfg,
+		pendingHashOpens: make(map[string]int),
 	}, nil
 }
 
@@ -121,6 +128,7 @@ func (o *Observer) Stop() error {
 	_, _ = unix.Write(o.stopW, []byte{0})
 	// Wait for readLoop to finish.
 	<-o.stopped
+	o.wg.Wait()
 
 	_ = unix.Close(o.fanotifyFD)
 	_ = unix.Close(o.mountFD)
@@ -186,11 +194,65 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 		return
 	}
 
+	o.mu.Lock()
+	if e.PID == int32(os.Getpid()) && e.Mask&unix.FAN_OPEN != 0 && o.pendingHashOpens[e.Path] > 0 {
+		o.pendingHashOpens[e.Path]--
+		if o.pendingHashOpens[e.Path] == 0 {
+			delete(o.pendingHashOpens, e.Path)
+		}
+		o.mu.Unlock()
+		e.Mask &^= unix.FAN_OPEN
+		if e.Mask == 0 {
+			return
+		}
+	} else {
+		o.mu.Unlock()
+	}
+
 	for _, actionType := range maskToActionTypes(e.Mask) {
-		o.events <- models.GroundTruthEvent{
-			Timestamp:  ts,
-			ActionType: actionType,
-			Target:     e.Path,
+		if actionType == models.FileClose {
+			o.wg.Add(1)
+			go func(action models.ActionType, target string, timestamp time.Time) {
+				defer o.wg.Done()
+
+				o.mu.Lock()
+				if o.pendingHashOpens == nil {
+					o.pendingHashOpens = make(map[string]int)
+				}
+				o.pendingHashOpens[target]++
+				o.mu.Unlock()
+
+				digest, err := content.SHA256File(target)
+
+				if err != nil {
+					o.mu.Lock()
+					o.pendingHashOpens[target]--
+					if o.pendingHashOpens[target] == 0 {
+						delete(o.pendingHashOpens, target)
+					}
+					o.mu.Unlock()
+
+					o.events <- models.GroundTruthEvent{
+						Timestamp:  timestamp,
+						ActionType: action,
+						Target:     target,
+					}
+					return
+				}
+
+				o.events <- models.GroundTruthEvent{
+					Timestamp:  timestamp,
+					ActionType: action,
+					Target:     target,
+					OutputHash: &digest,
+				}
+			}(actionType, e.Path, ts)
+		} else {
+			o.events <- models.GroundTruthEvent{
+				Timestamp:  ts,
+				ActionType: actionType,
+				Target:     e.Path,
+			}
 		}
 	}
 }

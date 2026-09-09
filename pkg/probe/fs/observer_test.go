@@ -123,6 +123,61 @@ func TestObserver_ModifyFile(t *testing.T) {
 	assertHasEvent(t, events, models.FileWrite, target)
 }
 
+func TestObserver_CloseWriteIncludesContentHash(t *testing.T) {
+	skipUnprivileged(t)
+	dir := t.TempDir()
+	obs := startObserver(t, dir)
+
+	target := filepath.Join(dir, "hashed.txt")
+	if err := os.WriteFile(target, []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	events := collectEvents(obs, 500*time.Millisecond)
+	_ = obs.Stop()
+
+	const want = "sha256:5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+	for _, event := range events {
+		if event.ActionType != models.FileClose || event.Target != target {
+			continue
+		}
+		if event.OutputHash == nil {
+			t.Fatal("FileClose event has no output hash")
+		}
+		if *event.OutputHash != want {
+			t.Errorf("FileClose hash = %q, want %q", *event.OutputHash, want)
+		}
+		return
+	}
+	t.Fatalf("no FileClose event for %s", target)
+}
+
+func TestObserverIgnoresHashReadOpen(t *testing.T) {
+	path := "/mock/dir/hashed.txt"
+	observer := &Observer{
+		events: make(chan models.GroundTruthEvent, 1),
+		cfg: Config{
+			PathFilter: "/mock",
+		},
+		pendingHashOpens: map[string]int{path: 1},
+	}
+
+	observer.processRawEvent(&rawEvent{
+		Mask: unix.FAN_OPEN,
+		PID:  int32(os.Getpid()),
+		Path: path,
+	}, time.Now())
+
+	if len(observer.pendingHashOpens) != 0 {
+		t.Errorf("pending hash opens = %v, want none", observer.pendingHashOpens)
+	}
+	select {
+	case event := <-observer.events:
+		t.Errorf("unexpected self-generated event: %#v", event)
+	default:
+	}
+}
+
 func TestObserver_DeleteFile(t *testing.T) {
 	skipUnprivileged(t)
 	dir := t.TempDir()

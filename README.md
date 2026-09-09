@@ -26,13 +26,15 @@ Verification is built up in tiers of increasing probe coverage:
 - **Tier 0** — core data model, matching, and verification logic, exercised with synthetic trajectories and ground truth.
 - **Tier 1** — filesystem probe (`pkg/probe/fs`, via `fanotify`).
 - **Tier 2** — process probe (`pkg/probe/proc`, via an in-kernel eBPF program on `execve`/`exit_group`/`sched_process_exit`), capturing exec argv, exit codes, and in-kernel timestamps.
+- **Tier 4 (in progress)** — filesystem content verification: SHA-256 of a file's final contents is recorded at `FAN_CLOSE_WRITE`.
 
-Tiers 3-6 (network probes, content hashing, and attack simulation) are planned but not yet implemented.
+Tier 3 (network), remaining Tier 4 evidence capture, Tier 5 (attack simulation), and Tier 6 (real-agent integration) are planned.
 
 ## Architecture
 
 ```
 pkg/models        Shared types: TrajectoryEntry, GroundTruthEvent, ActionType
+pkg/content       Shared SHA-256 content-digest helpers
 pkg/matching      Action matching rules, including command-path normalization
 pkg/verification  Trajectory-vs-ground-truth comparison and verdict classification
 pkg/probe         Observer interface every probe implements (used by cmd/watch)
