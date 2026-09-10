@@ -54,8 +54,24 @@ type Observer struct {
 	cfg              Config
 	overflow         bool // true if FAN_Q_OVERFLOW was seen
 	pendingHashOpens map[string]int
-	mu               sync.Mutex
-	wg               sync.WaitGroup
+
+	// pathGeneration counts write-class events (FAN_CREATE / FAN_MODIFY /
+	// FAN_CLOSE_WRITE) seen per path. The async post-close hash goroutine
+	// captures the generation at dispatch and re-checks it after the hash
+	// read completes: if the file was written again in that window, the
+	// digest can no longer be trusted to reflect the observed close, so no
+	// OutputHash is attached (see the TOCTOU note in processRawEvent). Grows
+	// unboundedly for the observer's lifetime -- entries are never garbage
+	// collected, matching pendingHashOpens' existing shape; revisit if a
+	// long-lived observer over many distinct paths becomes a memory concern.
+	pathGeneration map[string]uint64
+
+	// hashFile computes the content hash for a closed file. Defaults to
+	// content.SHA256File; overridable in tests to control goroutine timing.
+	hashFile func(string) (string, error)
+
+	mu sync.Mutex
+	wg sync.WaitGroup
 }
 
 // New creates an Observer. The caller must call Start to begin receiving
@@ -101,6 +117,8 @@ func New(cfg Config) (*Observer, error) {
 		stopped:          make(chan struct{}),
 		cfg:              cfg,
 		pendingHashOpens: make(map[string]int),
+		pathGeneration:   make(map[string]uint64),
+		hashFile:         content.SHA256File,
 	}, nil
 }
 
@@ -209,10 +227,28 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 		o.mu.Unlock()
 	}
 
+	// Bump the per-path write generation before dispatching anything. A
+	// write-class event means the file's content just changed; the async
+	// hash goroutine below compares this value after its read to detect a
+	// second write landing in the TOCTOU window between the observed close
+	// and the goroutine actually reading the file. The observer's own
+	// hash-read is a FAN_OPEN only (already stripped above) and never
+	// write-class, so it does not bump the generation.
+	var gen uint64
+	if e.Mask&(unix.FAN_CREATE|unix.FAN_MODIFY|unix.FAN_CLOSE_WRITE) != 0 {
+		o.mu.Lock()
+		if o.pathGeneration == nil {
+			o.pathGeneration = make(map[string]uint64)
+		}
+		o.pathGeneration[e.Path]++
+		gen = o.pathGeneration[e.Path]
+		o.mu.Unlock()
+	}
+
 	for _, actionType := range maskToActionTypes(e.Mask) {
 		if actionType == models.FileClose {
 			o.wg.Add(1)
-			go func(action models.ActionType, target string, timestamp time.Time) {
+			go func(action models.ActionType, target string, timestamp time.Time, gen uint64) {
 				defer o.wg.Done()
 
 				o.mu.Lock()
@@ -222,20 +258,32 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 				o.pendingHashOpens[target]++
 				o.mu.Unlock()
 
-				digest, err := content.SHA256File(target)
+				digest, err := o.hashFile(target)
 
+				o.mu.Lock()
+				raced := o.pathGeneration[target] != gen
 				if err != nil {
-					o.mu.Lock()
+					// Hashing failed early enough that no FAN_OPEN was
+					// generated, so the pendingHashOpens bump won't be
+					// balanced by the self-open path; undo it here. On the
+					// success path (including a raced success) the read did
+					// open the file, so that decrement happens when the
+					// self-FAN_OPEN is processed.
 					o.pendingHashOpens[target]--
 					if o.pendingHashOpens[target] == 0 {
 						delete(o.pendingHashOpens, target)
 					}
-					o.mu.Unlock()
+				}
+				o.mu.Unlock()
 
+				if err != nil || raced {
 					o.events <- models.GroundTruthEvent{
 						Timestamp:  timestamp,
 						ActionType: action,
 						Target:     target,
+						// No OutputHash: either hashing failed, or the file
+						// changed again before the hash could be trusted to
+						// reflect this specific close.
 					}
 					return
 				}
@@ -246,7 +294,7 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 					Target:     target,
 					OutputHash: &digest,
 				}
-			}(actionType, e.Path, ts)
+			}(actionType, e.Path, ts, gen)
 		} else {
 			o.events <- models.GroundTruthEvent{
 				Timestamp:  ts,

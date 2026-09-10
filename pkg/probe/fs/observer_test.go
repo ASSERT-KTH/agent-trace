@@ -178,6 +178,99 @@ func TestObserverIgnoresHashReadOpen(t *testing.T) {
 	}
 }
 
+// newHashSeamObserver builds an Observer wired for the pure-Go processRawEvent
+// path (no kernel), with a controllable content-hash function.
+func newHashSeamObserver(dir string, hashFile func(string) (string, error)) *Observer {
+	return &Observer{
+		events:           make(chan models.GroundTruthEvent, 16),
+		cfg:              Config{PathFilter: dir},
+		pendingHashOpens: map[string]int{},
+		pathGeneration:   map[string]uint64{},
+		hashFile:         hashFile,
+	}
+}
+
+func drainEvents(obs *Observer) []models.GroundTruthEvent {
+	var out []models.GroundTruthEvent
+	for {
+		select {
+		case e := <-obs.events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+// TestObserver_RacedCloseDropsHash pins the Fix 5 TOCTOU behavior: if a second
+// write-class event for a path lands while the post-close hash goroutine is
+// still reading, the digest can't be trusted to reflect the observed close, so
+// the FileClose event is emitted with no OutputHash rather than a maybe-wrong one.
+func TestObserver_RacedCloseDropsHash(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "raced.txt")
+
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	obs := newHashSeamObserver(dir, func(string) (string, error) {
+		close(entered)
+		<-release // hold the "hash read" open across the second write
+		return "sha256:stalehash", nil
+	})
+
+	// First FAN_CLOSE_WRITE: generation -> 1, dispatches the blocked goroutine.
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
+	<-entered
+
+	// Second write-class event for the same path: generation -> 2.
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_MODIFY, PID: int32(os.Getpid()), Path: target}, time.Now())
+
+	close(release)
+	obs.wg.Wait()
+
+	var closes int
+	for _, e := range drainEvents(obs) {
+		if e.ActionType != models.FileClose {
+			continue
+		}
+		closes++
+		if e.OutputHash != nil {
+			t.Errorf("raced FileClose should have no OutputHash, got %q", *e.OutputHash)
+		}
+	}
+	if closes != 1 {
+		t.Fatalf("expected exactly 1 FileClose event, got %d", closes)
+	}
+}
+
+// TestObserver_UnracedCloseKeepsHash is the companion: with nothing writing the
+// path again during the hash read, the digest is attached as before.
+func TestObserver_UnracedCloseKeepsHash(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "clean.txt")
+
+	obs := newHashSeamObserver(dir, func(string) (string, error) {
+		return "sha256:goodhash", nil
+	})
+
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
+	obs.wg.Wait()
+
+	var got *models.GroundTruthEvent
+	for _, e := range drainEvents(obs) {
+		if e.ActionType == models.FileClose {
+			ev := e
+			got = &ev
+		}
+	}
+	if got == nil {
+		t.Fatal("no FileClose event emitted")
+	}
+	if got.OutputHash == nil || *got.OutputHash != "sha256:goodhash" {
+		t.Fatalf("unraced FileClose should carry the digest, got %v", got.OutputHash)
+	}
+}
+
 func TestObserver_DeleteFile(t *testing.T) {
 	skipUnprivileged(t)
 	dir := t.TempDir()
