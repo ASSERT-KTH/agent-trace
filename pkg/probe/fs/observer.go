@@ -60,17 +60,36 @@ type Observer struct {
 	// before reading a closed file's content and re-checks it after: if the
 	// file was written again in that window, the digest can no longer be
 	// trusted to reflect the observed close, so no OutputHash is attached
-	// (see the TOCTOU note on hashSettled). Grows unboundedly for the
-	// observer's lifetime -- entries are never garbage collected, matching
-	// pendingHashOpens' existing shape; revisit if a long-lived observer
-	// over many distinct paths becomes a memory concern.
+	// (see the TOCTOU note on hashSettled). This catches a write racing
+	// during one specific hash read; it is not sufficient on its own to
+	// guarantee a hash reflects the file's eventual final content -- see
+	// pendingCloses. Grows unboundedly for the observer's lifetime --
+	// entries are never garbage collected, matching pendingHashOpens'
+	// existing shape; revisit if a long-lived observer over many distinct
+	// paths becomes a memory concern.
 	pathGeneration map[string]uint64
+
+	// pendingCloses holds, per path, the most recent FileClose still
+	// waiting to prove it won't be superseded before it is trusted enough
+	// to hash. See registerClose and resolveSettled for the full mechanism
+	// and why "nothing changed while I was reading" (pathGeneration) isn't
+	// by itself enough to guarantee a hash reflects the final content.
+	pendingCloses map[string]*pendingClose
 
 	// hashFile computes the content hash for a closed file. Defaults to
 	// content.SHA256File; overridable in tests to control the read's outcome.
 	hashFile func(string) (string, error)
 
 	mu sync.Mutex
+}
+
+// pendingClose is a FileClose observed for a path but not yet resolved to a
+// GroundTruthEvent. Its identity (the pointer itself) is what registerClose
+// and resolveSettled use to detect whether a given close survived a settle
+// cycle untouched, so a new pendingClose value is always allocated rather
+// than mutating one in place.
+type pendingClose struct {
+	ts time.Time // this close's own observed timestamp
 }
 
 // New creates an Observer. The caller must call Start to begin receiving
@@ -117,6 +136,7 @@ func New(cfg Config) (*Observer, error) {
 		cfg:              cfg,
 		pendingHashOpens: make(map[string]int),
 		pathGeneration:   make(map[string]uint64),
+		pendingCloses:    make(map[string]*pendingClose),
 		hashFile:         content.SHA256File,
 	}, nil
 }
@@ -156,6 +176,17 @@ func (o *Observer) Stop() error {
 	return nil
 }
 
+// settlePollMs bounds how long readLoop's blocking poll ever waits: a close
+// only ever gets hashed once it has survived one full iteration of this
+// loop untouched (see resolveSettled), so the loop needs to wake up
+// periodically to make that judgment even when nothing new arrives on the
+// fanotify fd. Correctness does not depend on this value -- a burst of
+// writes spanning many iterations just keeps superseding the pending close
+// for as many iterations as it takes -- it only trades off how quickly an
+// isolated close's hash is published against how often this loop wakes for
+// nothing.
+const settlePollMs = 20
+
 func (o *Observer) readLoop() {
 	defer close(o.stopped)
 
@@ -166,96 +197,94 @@ func (o *Observer) readLoop() {
 	}
 
 	for {
-		_, err := unix.Poll(pollFDs, -1)
+		_, err := unix.Poll(pollFDs, settlePollMs)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
 			}
+			o.flushPendingCloses(buf)
 			return
 		}
 
-		// Stop signal received.
+		// Stop signal received. Once stopping, no more writes will ever be
+		// observed, so it is always safe to resolve whatever is still
+		// pending rather than silently dropping it.
 		if pollFDs[1].Revents&unix.POLLIN != 0 {
+			o.flushPendingCloses(buf)
 			return
 		}
 
-		if pollFDs[0].Revents&unix.POLLIN == 0 {
-			continue
+		// Snapshot before draining: resolveSettled uses this to tell which
+		// of today's pending closes survive this iteration untouched
+		// (identity-compared against pendingCloses afterward) and are
+		// therefore safe to hash now, versus ones this same iteration just
+		// registered or superseded, which need at least one more iteration
+		// to prove themselves. See resolveSettled and registerClose for why
+		// this -- not pathGeneration alone -- is what actually guarantees a
+		// published hash reflects the file's eventual final content.
+		before := o.settleSnapshot()
+		if pollFDs[0].Revents&unix.POLLIN != 0 {
+			o.drainNonBlocking(buf)
 		}
-
-		// Drain everything already available rather than a single read: a
-		// burst of writes can queue up several records before this loop
-		// gets scheduled, and processing them all before hashing anything
-		// means a close's generation snapshot reflects every write already
-		// known about, not just whichever ones happened to fit in one read.
-		o.hashAndEmit(o.drainNonBlocking(buf), buf)
+		o.resolveSettled(before, buf)
 	}
 }
 
-// drainNonBlocking reads and processes every fanotify record currently
-// available without blocking, returning once none remain (or the stop pipe
-// becomes readable -- readLoop's own blocking poll notices that on its next
-// iteration, so this just needs to not spin past it). Used both for
-// readLoop's normal batch pickup and, from hashSettled, as the synchronous
-// catch-up that makes a close's generation check authoritative: any write
-// whose syscall has already returned has its notification already enqueued
-// here, whether or not this observer has gotten to it yet, so a
-// non-blocking drain right before trusting a hash is not a best-effort
-// peek, it is a real answer to "has anything else happened yet".
-func (o *Observer) drainNonBlocking(buf []byte) []pendingHash {
+// drainNonBlocking processes every fanotify record currently available
+// without blocking, returning once none remain (or the stop pipe becomes
+// readable -- the caller's own next check notices that, so this just needs
+// to not spin past it). Used both for readLoop's normal per-iteration
+// pickup and, from hashSettled, as the synchronous catch-up that makes its
+// generation check authoritative: any write whose syscall has already
+// returned has its notification already enqueued here, whether or not this
+// observer has gotten to it yet, so a non-blocking drain right before
+// trusting a hash is not a best-effort peek, it is a real answer to "has
+// anything else happened yet".
+func (o *Observer) drainNonBlocking(buf []byte) {
 	pollFDs := []unix.PollFd{
 		{Fd: int32(o.fanotifyFD), Events: unix.POLLIN},
 		{Fd: int32(o.stopR), Events: unix.POLLIN},
 	}
 
-	var pending []pendingHash
 	for {
 		_, err := unix.Poll(pollFDs, 0)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
 			}
-			return pending
+			return
 		}
 		if pollFDs[1].Revents&unix.POLLIN != 0 || pollFDs[0].Revents&unix.POLLIN == 0 {
-			return pending
+			return
 		}
 
 		n, err := unix.Read(o.fanotifyFD, buf)
 		if err != nil || n == 0 {
-			return pending
+			return
 		}
 
 		now := time.Now()
 		raw := parseEvents(buf, n, newKernelResolver(o.mountFD))
 		for i := range raw {
-			pending = append(pending, o.processRawEvent(&raw[i], now)...)
+			o.processRawEvent(&raw[i], now)
 		}
 	}
 }
 
-// pendingHash is a FileClose whose content hash still needs computing.
-// processRawEvent collects these instead of hashing them itself; see
-// hashAndEmit and hashSettled.
-type pendingHash struct {
-	target string
-	ts     time.Time
-}
-
-func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) []pendingHash {
+func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 	if e.Mask&unix.FAN_Q_OVERFLOW != 0 {
 		o.overflow = true
-		return nil
+		return
 	}
 
 	// PID filter.
 	if o.cfg.PIDFilter > 0 && e.PID != o.cfg.PIDFilter {
-		return nil
+		return
 	}
 
 	// Path filter.
 	if o.cfg.PathFilter != "" && !strings.HasPrefix(e.Path, o.cfg.PathFilter) {
-		return nil
+		return
 	}
 
 	o.mu.Lock()
@@ -267,7 +296,7 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) []pendingHash {
 		o.mu.Unlock()
 		e.Mask &^= unix.FAN_OPEN
 		if e.Mask == 0 {
-			return nil
+			return
 		}
 	} else {
 		o.mu.Unlock()
@@ -278,8 +307,11 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) []pendingHash {
 	// snapshots this value before reading a close's content and compares it
 	// again afterward (via a synchronous catch-up drain, not just whatever
 	// this call happened to see), to detect a write landing in the TOCTOU
-	// window either before the read started or during it. The observer's
-	// own hash-read is a FAN_OPEN only (already stripped above) and never
+	// window either before the read started or during it. This alone only
+	// proves nothing changed during one specific read -- it says nothing
+	// about writes that haven't happened yet -- which is why registerClose
+	// below carries the real guarantee for closes. The observer's own
+	// hash-read is a FAN_OPEN only (already stripped above) and never
 	// write-class, so it does not bump the generation.
 	if e.Mask&(unix.FAN_CREATE|unix.FAN_MODIFY|unix.FAN_CLOSE_WRITE) != 0 {
 		o.mu.Lock()
@@ -290,10 +322,9 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) []pendingHash {
 		o.mu.Unlock()
 	}
 
-	var pending []pendingHash
 	for _, actionType := range maskToActionTypes(e.Mask) {
 		if actionType == models.FileClose {
-			pending = append(pending, pendingHash{target: e.Path, ts: ts})
+			o.registerClose(e.Path, ts)
 		} else {
 			o.events <- models.GroundTruthEvent{
 				Timestamp:  ts,
@@ -302,30 +333,80 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) []pendingHash {
 			}
 		}
 	}
-	return pending
 }
 
-// hashAndEmit resolves every pending FileClose to a GroundTruthEvent and
-// emits it. It is a worklist rather than a single pass over pending because
-// hashSettled's own catch-up drain (see below) can discover further closes
-// -- for this path or another -- that arrived while a hash was being read;
-// those need the same treatment, with their own fresh generation snapshot,
-// not to be silently dropped.
-func (o *Observer) hashAndEmit(pending []pendingHash, buf []byte) {
-	for len(pending) > 0 {
-		p := pending[0]
-		pending = pending[1:]
+// registerClose records a newly observed FileClose for path as the pending
+// one to judge on some future settle check (see resolveSettled). If a close
+// was already pending for this same path, that older one is immediately
+// superseded: a second close arriving proves the first's content is not the
+// file's final content, so there's no point even reading it -- it is
+// emitted right here with no OutputHash.
+//
+// This, not pathGeneration, is what actually guarantees a hash the observer
+// does attach reflects the eventual final content: a close is never hashed
+// until it has survived a full settle cycle with nothing superseding it.
+func (o *Observer) registerClose(path string, ts time.Time) {
+	o.mu.Lock()
+	if o.pendingCloses == nil {
+		o.pendingCloses = make(map[string]*pendingClose)
+	}
+	superseded, existed := o.pendingCloses[path]
+	o.pendingCloses[path] = &pendingClose{ts: ts}
+	o.mu.Unlock()
 
-		digest, ok, more := o.hashSettled(p.target, buf)
-		pending = append(pending, more...)
-
-		event := models.GroundTruthEvent{
-			Timestamp:  p.ts,
+	if existed {
+		o.events <- models.GroundTruthEvent{
+			Timestamp:  superseded.ts,
 			ActionType: models.FileClose,
-			Target:     p.target,
-			// OutputHash left nil below when hashing failed, or the file
-			// changed again before the read could be trusted to reflect
-			// this specific close.
+			Target:     path,
+			// No OutputHash: a newer close for this path arrived before
+			// this one was ever judged settled.
+		}
+	}
+}
+
+// settleSnapshot copies the current pendingCloses so resolveSettled can
+// later tell, by pointer identity, which entries survived a settle cycle
+// unchanged.
+func (o *Observer) settleSnapshot() map[string]*pendingClose {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	snap := make(map[string]*pendingClose, len(o.pendingCloses))
+	for path, entry := range o.pendingCloses {
+		snap[path] = entry
+	}
+	return snap
+}
+
+// resolveSettled hashes and emits every entry in before that is still the
+// current pendingCloses entry for its path -- i.e. survived this settle
+// cycle without being superseded by a newer close (registerClose) -- and
+// removes it from pendingCloses. An entry that was superseded, or that no
+// longer matches (already resolved by a concurrent call), is left alone:
+// registerClose already emitted it, or a later cycle will judge it.
+func (o *Observer) resolveSettled(before map[string]*pendingClose, buf []byte) {
+	for path, entry := range before {
+		o.mu.Lock()
+		current, ok := o.pendingCloses[path]
+		settled := ok && current == entry
+		if settled {
+			delete(o.pendingCloses, path)
+		}
+		o.mu.Unlock()
+
+		if !settled {
+			continue
+		}
+
+		digest, ok := o.hashSettled(path, buf)
+		event := models.GroundTruthEvent{
+			Timestamp:  entry.ts,
+			ActionType: models.FileClose,
+			Target:     path,
+			// OutputHash left nil below when hashing failed, or a write
+			// raced in during the read itself (hashSettled's own check);
+			// a write landing before this point would instead have gone
+			// through registerClose's supersession above.
 		}
 		if ok {
 			event.OutputHash = &digest
@@ -334,21 +415,25 @@ func (o *Observer) hashAndEmit(pending []pendingHash, buf []byte) {
 	}
 }
 
-// hashSettled reads target's content and decides whether that read can be
-// trusted to represent the close it's being attached to. Hashing happens
-// synchronously here, in the single reader goroutine, specifically so the
-// generation check below is authoritative rather than racing an
-// independently-scheduled goroutine: after hashFile returns, it drains
-// (non-blocking) anything already sitting in the fanotify queue -- which,
-// by fanotify's own ordering guarantee, already includes the notification
-// for any write whose syscall has already completed, whether or not this
-// observer has processed it yet -- before comparing the path's generation
-// against the snapshot taken before the read. If they differ, the file was
-// touched again in that window and the read cannot be trusted.
-//
-// The returned pendingHash slice is whatever the catch-up drain discovered;
-// the caller (hashAndEmit) is responsible for resolving those too.
-func (o *Observer) hashSettled(target string, buf []byte) (digest string, ok bool, more []pendingHash) {
+// flushPendingCloses resolves everything still pending at shutdown. Once
+// the observer is stopping, no more writes will ever be observed, so every
+// remaining entry is by definition settled.
+func (o *Observer) flushPendingCloses(buf []byte) {
+	o.resolveSettled(o.settleSnapshot(), buf)
+}
+
+// hashSettled reads target's content and decides whether that specific read
+// can be trusted, i.e. nothing changed while it was in progress. It is the
+// second, narrower line of defense after registerClose/resolveSettled
+// (which guarantee the close wasn't already superseded before this call):
+// after hashFile returns, it drains (non-blocking) anything already sitting
+// in the fanotify queue -- which, by fanotify's own ordering guarantee,
+// already includes the notification for any write whose syscall has
+// already completed, whether or not this observer has processed it yet --
+// before comparing the path's generation against the snapshot taken before
+// the read. If they differ, the file was touched again during the read and
+// it cannot be trusted.
+func (o *Observer) hashSettled(target string, buf []byte) (digest string, ok bool) {
 	o.mu.Lock()
 	gen := o.pathGeneration[target]
 	if o.pendingHashOpens == nil {
@@ -359,7 +444,7 @@ func (o *Observer) hashSettled(target string, buf []byte) (digest string, ok boo
 
 	d, err := o.hashFile(target)
 
-	more = o.drainNonBlocking(buf)
+	o.drainNonBlocking(buf)
 
 	o.mu.Lock()
 	raced := o.pathGeneration[target] != gen
@@ -378,9 +463,9 @@ func (o *Observer) hashSettled(target string, buf []byte) (digest string, ok boo
 	o.mu.Unlock()
 
 	if err != nil || raced {
-		return "", false, more
+		return "", false
 	}
-	return d, true, more
+	return d, true
 }
 
 // maskToActionTypes maps fanotify event mask bits to models.ActionType values.

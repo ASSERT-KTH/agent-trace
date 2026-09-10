@@ -227,7 +227,9 @@ func drainEvents(obs *Observer) []models.GroundTruthEvent {
 // event is emitted with no OutputHash rather than a maybe-wrong one. Hashing
 // is synchronous now (see hashSettled), so the mock hashFile itself stands in
 // for "a write landed during the read" by bumping the generation as a side
-// effect, exactly like a concurrent write's fanotify event would.
+// effect, exactly like a concurrent write's fanotify event would. This
+// exercises hashSettled's own narrower check; the close is driven through a
+// settle cycle first, exactly as resolveSettled would.
 func TestObserver_RacedCloseDropsHash(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "raced.txt")
@@ -241,8 +243,9 @@ func TestObserver_RacedCloseDropsHash(t *testing.T) {
 	// FAN_CLOSE_WRITE: generation -> 1. The mock hashFile bumps it to 2
 	// mid-read, simulating the second write-class event landing while the
 	// content was being read.
-	pending := obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
-	obs.hashAndEmit(pending, hashSeamBuf())
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
+	before := obs.settleSnapshot()
+	obs.resolveSettled(before, hashSeamBuf())
 
 	var closes int
 	for _, e := range drainEvents(obs) {
@@ -269,8 +272,9 @@ func TestObserver_UnracedCloseKeepsHash(t *testing.T) {
 		return "sha256:goodhash", nil
 	})
 
-	pending := obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
-	obs.hashAndEmit(pending, hashSeamBuf())
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
+	before := obs.settleSnapshot()
+	obs.resolveSettled(before, hashSeamBuf())
 
 	var got *models.GroundTruthEvent
 	for _, e := range drainEvents(obs) {
@@ -287,18 +291,12 @@ func TestObserver_UnracedCloseKeepsHash(t *testing.T) {
 	}
 }
 
-// TestObserver_BatchedCloseTrustsPostBatchGeneration pins the within-batch
-// fix directly: a single fanotify read can return several write-class
-// records for the same path in one call whenever writes land faster than
-// readLoop drains them, and processRawEvent handles them one at a time. If a
-// close's generation snapshot were captured inline, per event, it would miss
-// a bump from a later event already sitting in the very same batch, and the
-// eventual hash read (necessarily more current) would get wrongly flagged as
-// raced against that stale baseline. Snapshotting only in hashSettled, after
-// the whole batch has bumped pathGeneration, avoids that: the snapshot
-// always reflects every write-class event already known about, so the
-// close's own hash read (real disk state, standing in here for the mock) is
-// trusted and reported exactly once, not spuriously flagged as raced.
+// TestObserver_BatchedCloseTrustsPostBatchGeneration checks that a bare
+// write-class event (no intervening close) for the same path, seen before a
+// close is ever resolved, is folded into the generation snapshot rather than
+// wrongly flagged as a race: both events run through processRawEvent before
+// the settle cycle resolves the close, so hashSettled's own generation check
+// sees no further change during the read itself and trusts it.
 func TestObserver_BatchedCloseTrustsPostBatchGeneration(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "batched.txt")
@@ -308,13 +306,14 @@ func TestObserver_BatchedCloseTrustsPostBatchGeneration(t *testing.T) {
 	})
 
 	// Simulate one fanotify read returning both records together: both run
-	// through processRawEvent (bumping generation twice) before either's
-	// hash is resolved.
+	// through processRawEvent (bumping generation twice) before the close
+	// is ever resolved.
 	now := time.Now()
-	var pending []pendingHash
-	pending = append(pending, obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, now)...)
-	pending = append(pending, obs.processRawEvent(&rawEvent{Mask: unix.FAN_MODIFY, PID: int32(os.Getpid()), Path: target}, now)...)
-	obs.hashAndEmit(pending, hashSeamBuf())
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, now)
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_MODIFY, PID: int32(os.Getpid()), Path: target}, now)
+
+	before := obs.settleSnapshot()
+	obs.resolveSettled(before, hashSeamBuf())
 
 	var got *models.GroundTruthEvent
 	for _, e := range drainEvents(obs) {
@@ -328,6 +327,67 @@ func TestObserver_BatchedCloseTrustsPostBatchGeneration(t *testing.T) {
 	}
 	if got.OutputHash == nil || *got.OutputHash != "sha256:final" {
 		t.Fatalf("batched close should trust its post-batch generation snapshot and carry the digest, got %v", got.OutputHash)
+	}
+}
+
+// TestObserver_SupersededCloseNeverHashed pins the actual guarantee behind
+// Fix 5's second round: a close is never hashed until it has survived a full
+// settle cycle unchanged. If a newer close for the same path arrives first,
+// the older one is superseded immediately -- emitted with no hash, without
+// ever calling hashFile -- because it provably cannot be the file's final
+// content. This is the scenario pathGeneration alone cannot catch: nothing
+// races "during" the first close's read because it is never read at all.
+func TestObserver_SupersededCloseNeverHashed(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "superseded.txt")
+
+	var hashCalls int
+	obs := newHashSeamObserver(t, dir, func(string) (string, error) {
+		hashCalls++
+		return "sha256:final", nil
+	})
+
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
+	// A second close for the same path arrives before the first is ever
+	// judged settled -- superseding it right here, immediately.
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
+
+	var closes int
+	for _, e := range drainEvents(obs) {
+		if e.ActionType != models.FileClose {
+			continue
+		}
+		closes++
+		if e.OutputHash != nil {
+			t.Errorf("superseded FileClose should have no OutputHash, got %q", *e.OutputHash)
+		}
+	}
+	if closes != 1 {
+		t.Fatalf("expected exactly 1 (superseded) FileClose event before settling, got %d", closes)
+	}
+	if hashCalls != 0 {
+		t.Errorf("superseded close should never be hashed, got %d hashFile calls", hashCalls)
+	}
+
+	// The surviving (second) close settles normally on the next cycle.
+	before := obs.settleSnapshot()
+	obs.resolveSettled(before, hashSeamBuf())
+
+	var got *models.GroundTruthEvent
+	for _, e := range drainEvents(obs) {
+		if e.ActionType == models.FileClose {
+			ev := e
+			got = &ev
+		}
+	}
+	if got == nil {
+		t.Fatal("no FileClose event emitted for the surviving close")
+	}
+	if got.OutputHash == nil || *got.OutputHash != "sha256:final" {
+		t.Fatalf("surviving close should carry the digest, got %v", got.OutputHash)
+	}
+	if hashCalls != 1 {
+		t.Errorf("expected exactly 1 hashFile call, got %d", hashCalls)
 	}
 }
 

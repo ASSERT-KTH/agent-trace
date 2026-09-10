@@ -122,12 +122,12 @@ func main() {
 	flag.IntVar(&rootPID, "root-pid", 0, "Attach the proc probe's ancestry root to this already-running PID instead of launching the agent. RACE: anything that PID did before this call is invisible to the proc probe (the fs probe is unaffected). Mutually exclusive with a trailing -- <command>.")
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
-		fmt.Fprintln(out, "Usage: watch --workspace PATH [flags] [-- <agent command> [args...]]")
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, "With a trailing `-- <command>`, watch launches the command, records its PID as")
-		fmt.Fprintln(out, "the proc probe's ancestry root, runs it to completion, then writes the ground")
-		fmt.Fprintln(out, "truth. Without one, watch records until Ctrl+C.")
-		fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, "Usage: watch --workspace PATH [flags] [-- <agent command> [args...]]")
+		_, _ = fmt.Fprintln(out)
+		_, _ = fmt.Fprintln(out, "With a trailing `-- <command>`, watch launches the command, records its PID as")
+		_, _ = fmt.Fprintln(out, "the proc probe's ancestry root, runs it to completion, then writes the ground")
+		_, _ = fmt.Fprintln(out, "truth. Without one, watch records until Ctrl+C.")
+		_, _ = fmt.Fprintln(out)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
