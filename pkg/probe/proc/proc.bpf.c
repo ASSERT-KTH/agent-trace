@@ -44,6 +44,43 @@ char LICENSE[] SEC("license") = "GPL";
 #define KIND_EXEC 0
 #define KIND_EXIT 1
 
+// SHELL_PATHS (Fix 3b): binaries whose children inherit top-level status
+// from them, so a chain of pure shell re-execs (sh -c 'bash -c "cmd"')
+// keeps its payload verification-grade instead of demoting it to
+// forensic-only. is_shell is re-evaluated for every non-root PID at every
+// execve: a shell that execs a real tool stops vouching for that tool's
+// children, and a non-shell that execs a shell starts. The ancestry root is
+// exempt -- its is_shell=1 is a synthetic "my children are agent actions"
+// marker, not a claim that the root is itself a shell.
+//
+// Deliberately does NOT include /usr/bin/env: env does not fork, it
+// re-execs the same PID into its target, so env's own is_shell status is
+// irrelevant; whatever it ultimately execs into is classified on its own
+// merits at that execve.
+//
+// path_is(fn, literal) exact-matches the NUL-terminated string in fn
+// against a compile-time string literal as a fully unrolled fixed-length
+// compare. Every index into `literal` folds to a constant; fn is the
+// 256-byte e->filename, so fn[i] for i < sizeof(literal) is always in
+// bounds. sizeof(literal) includes the NUL, and bpf_probe_read_user_str
+// writes that NUL into fn, so this checks fn's terminator too -- an exact
+// match, not a prefix.
+#define path_is(fn, literal) __extension__({                       \
+	int _match = 1;                                            \
+	_Pragma("clang loop unroll(full)")                        \
+	for (unsigned _i = 0; _i < sizeof(literal); _i++)          \
+		_match &= ((fn)[_i] == (literal)[_i]);             \
+	_match;                                                    \
+})
+
+static __always_inline int filename_is_shell(const char *fn)
+{
+	return path_is(fn, "/bin/sh")   || path_is(fn, "/usr/bin/sh")   ||
+	       path_is(fn, "/bin/bash") || path_is(fn, "/usr/bin/bash") ||
+	       path_is(fn, "/bin/dash") || path_is(fn, "/usr/bin/dash") ||
+	       path_is(fn, "/bin/zsh")  || path_is(fn, "/usr/bin/zsh");
+}
+
 // struct event carries both `filename` and `args`. `filename` is the path
 // the kernel actually resolved and loaded (ctx->filename on sys_enter_execve),
 // independent of whatever the caller chose to put in argv. `args` still
@@ -89,6 +126,23 @@ struct {
 static __always_inline __u8 get_use_pid_filter() {
 	__u32 zero = 0;
 	__u8 *val = bpf_map_lookup_elem(&config_map, &zero);
+	return val ? *val : 0;
+}
+
+// root_pid_map holds the ancestry root PID (PIDFilter). Fix 3b needs it to
+// exempt the root from per-execve is_shell re-evaluation: the root's
+// is_shell=1 is synthetic and must not be downgraded when the root execs a
+// non-shell agent binary.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} root_pid_map SEC(".maps");
+
+static __always_inline __u32 get_root_pid() {
+	__u32 zero = 0;
+	__u32 *val = bpf_map_lookup_elem(&root_pid_map, &zero);
 	return val ? *val : 0;
 }
 
@@ -166,11 +220,18 @@ int handle_fork(struct task_newtask_ctx *ctx)
 		return 0;
 
 	struct proc_info child = {0};
-	// A direct child of the shell is a top-level command.
-	if (p->is_shell) {
+	// A new process is verification-grade (top-level) only if its parent is
+	// on the top-level shell chain: the parent must be itself top-level AND
+	// a shell. Fix 3b keeps is_shell current per-execve and seeds the
+	// ancestry root as {is_shell=1, is_toplevel=1}, so this propagates
+	// through a chain of shell re-execs and breaks at the first non-shell.
+	// A non-shell tool like `make`, reached as a direct child of a shell,
+	// is itself top-level but its own children go back to forensic-only --
+	// even when `make` runs its recipe through /bin/sh, because that shell
+	// was forked by non-top-level `make`.
+	if (p->is_shell && p->is_toplevel) {
 		child.is_toplevel = 1;
 	} else {
-		// Grandchildren are forensic-grade.
 		child.is_toplevel = 0;
 	}
 
@@ -190,23 +251,33 @@ int handle_execve(struct sys_enter_execve_ctx *ctx)
 
 	e->pid = pid;
 	e->kind = KIND_EXEC;
-	if (get_use_pid_filter()) {
-		struct proc_info *p = bpf_map_lookup_elem(&tracked_pids, &pid);
-		if (!p)
-			return 0;
-		e->is_toplevel = p->is_toplevel;
-	} else {
-		e->is_toplevel = 1;
-	}
-
 	e->ts_ns = bpf_ktime_get_ns();
 	e->exit_code = 0;
 	e->has_exit_code = 0;
 
 	// Read the kernel-resolved path directly, not from argv. This is the
-	// field the verifier trusts as the process's real identity.
+	// field the verifier trusts as the process's real identity, and the
+	// Fix 3b shell classification below keys off it, so it must be resolved
+	// before the ancestry bookkeeping.
 	e->filename[0] = '\0';
 	bpf_probe_read_user_str(&e->filename, sizeof(e->filename), ctx->filename);
+
+	if (get_use_pid_filter()) {
+		struct proc_info *p = bpf_map_lookup_elem(&tracked_pids, &pid);
+		if (!p)
+			return 0;
+		e->is_toplevel = p->is_toplevel;
+		// Fix 3b: keep is_shell current with the binary actually running,
+		// re-evaluated at every execve (both upgrade and downgrade). p
+		// points into the hash map's own storage, so this write lands in
+		// place. The ancestry root is exempt -- its is_shell=1 is synthetic
+		// and downgrading it would demote every real agent subprocess.
+		__u32 root = get_root_pid();
+		if (root && pid != root)
+			p->is_shell = filename_is_shell(e->filename) ? 1 : 0;
+	} else {
+		e->is_toplevel = 1;
+	}
 
 	__u32 nargs = 0;
 	int done = 0;

@@ -229,6 +229,122 @@ func TestObserver_ResistsArgv0Spoofing(t *testing.T) {
 	}
 }
 
+// TestObserver_ShellChainStaysTopLevel is the live-kernel proof for Fix 3b:
+// a chain of pure shell re-execs must keep its payload verification-grade,
+// not demote it to forensic-only at a depth-1 cutoff. The test process is
+// the ancestry root. The outer shell forks (`& wait`) an inner shell, so
+// the final `/bin/echo` is a genuine grandchild reached across a fork
+// through a shell -- exactly what a depth-1 rule would demote. Under 3b it
+// must still be IsTopLevel.
+func TestObserver_ShellChainStaysTopLevel(t *testing.T) {
+	skipUnprivileged(t)
+
+	nonce := fmt.Sprintf("agenttrace-shellchain-%d", time.Now().UnixNano())
+
+	obs, err := New(Config{EventBufSize: 512})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// The test process is the ancestry root: its own exec is suppressed by
+	// PID, and the descendants spawned below are what we assert on.
+	if err := obs.SetRootPID(int32(os.Getpid())); err != nil {
+		t.Fatalf("SetRootPID: %v", err)
+	}
+	obs.Start()
+	time.Sleep(150 * time.Millisecond)
+
+	script := "/bin/sh -c '/bin/echo " + nonce + " chain' & wait"
+	if err := exec.Command("/bin/sh", "-c", script).Run(); err != nil {
+		t.Fatalf("spawn nested shell chain: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if err := obs.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	got := collect(obs)
+	var sawEcho bool
+	for _, e := range got {
+		if e.ActionType != models.ProcessExec || !strings.HasPrefix(e.Target, "/bin/echo ") {
+			continue
+		}
+		if !strings.Contains(e.Target, nonce) {
+			continue
+		}
+		sawEcho = true
+		if e.IsTopLevel == nil || !*e.IsTopLevel {
+			t.Errorf("nested-shell echo should be top-level, got IsTopLevel=%v (target %q)",
+				e.IsTopLevel, e.Target)
+		}
+	}
+	if !sawEcho {
+		t.Fatalf("no /bin/echo exec event for the nested-shell chain; got %d events: %v", len(got), got)
+	}
+}
+
+// TestObserver_NonShellIntermediateDemotesChildren is the contrast to
+// TestObserver_ShellChainStaysTopLevel: once the chain hits a real
+// (non-shell) binary, that binary is still top-level itself but its own
+// children go back to forensic-only. Here `xargs` (spawned by a shell) is
+// the non-shell intermediate and the `/bin/echo <nonce>` it forks must be
+// IsTopLevel=false. This is the make->cc false-positive fix, preserved.
+func TestObserver_NonShellIntermediateDemotesChildren(t *testing.T) {
+	skipUnprivileged(t)
+
+	nonce := fmt.Sprintf("agenttrace-nonshell-%d", time.Now().UnixNano())
+
+	obs, err := New(Config{EventBufSize: 512})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := obs.SetRootPID(int32(os.Getpid())); err != nil {
+		t.Fatalf("SetRootPID: %v", err)
+	}
+	obs.Start()
+	time.Sleep(150 * time.Millisecond)
+
+	// The nonce appears in three argv strings: the root `sh -c <script>`,
+	// the `xargs /bin/echo <nonce> leaf` xargs itself execs, and the
+	// `/bin/echo <nonce> leaf` that xargs forks. They are told apart by
+	// command token: the leaf is the one whose resolved path is /bin/echo.
+	script := "echo | /usr/bin/xargs /bin/echo " + nonce + " leaf"
+	if err := exec.Command("/bin/sh", "-c", script).Run(); err != nil {
+		t.Fatalf("spawn shell -> xargs -> echo: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if err := obs.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	got := collect(obs)
+	var sawLeaf, sawXargs bool
+	for _, e := range got {
+		if e.ActionType != models.ProcessExec || !strings.Contains(e.Target, nonce) {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(e.Target, "/usr/bin/xargs "):
+			sawXargs = true
+			if e.IsTopLevel == nil || !*e.IsTopLevel {
+				t.Errorf("xargs (direct child of the shell) should be top-level, got %v", e.IsTopLevel)
+			}
+		case strings.HasPrefix(e.Target, "/bin/echo "):
+			sawLeaf = true
+			if e.IsTopLevel != nil && *e.IsTopLevel {
+				t.Errorf("echo forked by xargs should be forensic-only, got IsTopLevel=true (target %q)", e.Target)
+			}
+		}
+	}
+	if !sawXargs {
+		t.Fatalf("no exec event for xargs; got %d events: %v", len(got), got)
+	}
+	if !sawLeaf {
+		t.Fatalf("no /bin/echo exec event forked by xargs; got %d events: %v", len(got), got)
+	}
+}
+
 func TestObserver_CommandFilterExcludesOthers(t *testing.T) {
 	skipUnprivileged(t)
 

@@ -106,7 +106,15 @@ func New(cfg Config) (*Observer, error) {
 			return nil, fmt.Errorf("update config_map: %w", err)
 		}
 		pid := uint32(cfg.PIDFilter)
-		info := bpfProcInfo{IsShell: 1}
+		if err := objs.RootPidMap.Update(&zero, &pid, ebpf.UpdateAny); err != nil {
+			_ = objs.Close()
+			return nil, fmt.Errorf("update root_pid_map: %w", err)
+		}
+		// Seed the root as a top-level shell: is_shell=1 so its direct
+		// children are verification-grade, is_toplevel=1 so handle_fork's
+		// "parent is on the top-level shell chain" rule propagates from it.
+		// The root is exempt from per-execve is_shell re-evaluation (Fix 3b).
+		info := bpfProcInfo{IsShell: 1, IsToplevel: 1}
 		if err := objs.TrackedPids.Update(&pid, &info, ebpf.UpdateAny); err != nil {
 			_ = objs.Close()
 			return nil, fmt.Errorf("update tracked_pids: %w", err)
@@ -340,7 +348,13 @@ func (o *Observer) SetRootPID(pid int32) error {
 		return fmt.Errorf("update config_map: %w", err)
 	}
 	p := uint32(pid)
-	info := bpfProcInfo{IsShell: 1}
+	if err := o.objs.RootPidMap.Update(&zero, &p, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update root_pid_map: %w", err)
+	}
+	// Seed the root as a top-level shell: is_shell=1 so its direct children
+	// are verification-grade, is_toplevel=1 so handle_fork's shell-chain
+	// rule propagates from it. Exempt from per-execve is_shell re-eval (3b).
+	info := bpfProcInfo{IsShell: 1, IsToplevel: 1}
 	if err := o.objs.TrackedPids.Update(&p, &info, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update tracked_pids: %w", err)
 	}

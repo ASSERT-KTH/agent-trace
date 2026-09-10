@@ -126,6 +126,41 @@ func TestDescendantGroundTruthIsIgnored(t *testing.T) {
 	}
 }
 
+// Fix 3b end-to-end semantics: for a chain of pure shell re-execs, 3b keeps
+// the inner command verification-grade (IsTopLevel: true), so a trajectory
+// that only reports the outer `sh -c ...` invocation is still missing the
+// command the shell actually ran and must come back NOT FAITHFUL. This is
+// the inverse of TestDescendantGroundTruthIsIgnored: there a forensic
+// descendant is correctly ignored; here a shell-routed command is top-level
+// and must not be. The forensic third event confirms the boundary still
+// holds -- Verify uses whatever IsTopLevel values it is given, and 3b's job
+// is to feed it the right ones.
+func TestShellChainInnerCommandIsUnrecorded(t *testing.T) {
+	traj := models.Trajectory{
+		te(0, models.ProcessExec, "/bin/sh -c echo-hello", nil, nil),
+	}
+	ground := models.GroundTruth{
+		{IsTopLevel: bp(true), Timestamp: baseTime.Add(2 * time.Millisecond),
+			ActionType: models.ProcessExec, Target: "/bin/sh -c echo-hello"},
+		{IsTopLevel: bp(true), Timestamp: baseTime.Add(6 * time.Millisecond),
+			ActionType: models.ProcessExec, Target: "/bin/echo hello"},
+		{IsTopLevel: bp(false), Timestamp: baseTime.Add(7 * time.Millisecond),
+			ActionType: models.ProcessExec, Target: "/lib/ld-linux.so helper"},
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if v.Faithful {
+		t.Error("shell-routed inner command must not read as faithful")
+	}
+	if len(v.Corroborated) != 1 {
+		t.Errorf("expected the outer sh invocation corroborated, got %d", len(v.Corroborated))
+	}
+	if len(v.Unrecorded) != 1 || v.Unrecorded[0].Target != "/bin/echo hello" {
+		t.Errorf("expected only the inner shell-routed command unrecorded, got %+v", v.Unrecorded)
+	}
+}
+
 func TestLegacyGroundTruthDefaultsToTopLevel(t *testing.T) {
 	traj := models.Trajectory{te(0, models.FileRead, "/tmp/file", nil, nil)}
 	ground := models.GroundTruth{
