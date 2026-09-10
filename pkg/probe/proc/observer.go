@@ -49,6 +49,18 @@ type Config struct {
 	// in tests and on shared hosts.
 	CommandFilter string
 
+	// DeferRootPID, if true and PIDFilter is 0, puts the probe into
+	// ancestry-filtered mode immediately (an empty tracked_pids, so every
+	// event is dropped) instead of the zero-value default of global mode
+	// (every process on the host treated as top-level). Set this whenever
+	// the caller will call SetRootPID once the root PID becomes known --
+	// e.g. exec-wrap ("spawn the agent, then learn its PID") -- so there is
+	// no window between New and SetRootPID during which unrelated host
+	// activity gets recorded as verification-grade ground truth. Leave it
+	// false for a genuine "no ancestry scoping, watch the whole host" probe
+	// that will never call SetRootPID.
+	DeferRootPID bool
+
 	// EventBufSize is the channel buffer size for emitted events.
 	// Defaults to 4096 if zero.
 	EventBufSize int
@@ -98,13 +110,17 @@ func New(cfg Config) (*Observer, error) {
 		return nil, fmt.Errorf("load eBPF objects: %w", err)
 	}
 
-	if cfg.PIDFilter > 0 {
+	if cfg.PIDFilter > 0 || cfg.DeferRootPID {
 		zero := uint32(0)
 		one := uint8(1)
 		if err := objs.ConfigMap.Update(&zero, &one, ebpf.UpdateAny); err != nil {
 			_ = objs.Close()
 			return nil, fmt.Errorf("update config_map: %w", err)
 		}
+	}
+
+	if cfg.PIDFilter > 0 {
+		zero := uint32(0)
 		pid := uint32(cfg.PIDFilter)
 		if err := objs.RootPidMap.Update(&zero, &pid, ebpf.UpdateAny); err != nil {
 			_ = objs.Close()

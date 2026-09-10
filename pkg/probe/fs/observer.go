@@ -56,22 +56,21 @@ type Observer struct {
 	pendingHashOpens map[string]int
 
 	// pathGeneration counts write-class events (FAN_CREATE / FAN_MODIFY /
-	// FAN_CLOSE_WRITE) seen per path. The async post-close hash goroutine
-	// captures the generation at dispatch and re-checks it after the hash
-	// read completes: if the file was written again in that window, the
-	// digest can no longer be trusted to reflect the observed close, so no
-	// OutputHash is attached (see the TOCTOU note in processRawEvent). Grows
-	// unboundedly for the observer's lifetime -- entries are never garbage
-	// collected, matching pendingHashOpens' existing shape; revisit if a
-	// long-lived observer over many distinct paths becomes a memory concern.
+	// FAN_CLOSE_WRITE) seen per path. hashSettled snapshots the generation
+	// before reading a closed file's content and re-checks it after: if the
+	// file was written again in that window, the digest can no longer be
+	// trusted to reflect the observed close, so no OutputHash is attached
+	// (see the TOCTOU note on hashSettled). Grows unboundedly for the
+	// observer's lifetime -- entries are never garbage collected, matching
+	// pendingHashOpens' existing shape; revisit if a long-lived observer
+	// over many distinct paths becomes a memory concern.
 	pathGeneration map[string]uint64
 
 	// hashFile computes the content hash for a closed file. Defaults to
-	// content.SHA256File; overridable in tests to control goroutine timing.
+	// content.SHA256File; overridable in tests to control the read's outcome.
 	hashFile func(string) (string, error)
 
 	mu sync.Mutex
-	wg sync.WaitGroup
 }
 
 // New creates an Observer. The caller must call Start to begin receiving
@@ -144,9 +143,10 @@ func (o *Observer) Start() {
 func (o *Observer) Stop() error {
 	// Signal the poll loop.
 	_, _ = unix.Write(o.stopW, []byte{0})
-	// Wait for readLoop to finish.
+	// Wait for readLoop to finish. Hashing is synchronous within readLoop
+	// now (see hashSettled), so there are no outstanding goroutines to wait
+	// on beyond readLoop itself.
 	<-o.stopped
-	o.wg.Wait()
 
 	_ = unix.Close(o.fanotifyFD)
 	_ = unix.Close(o.mountFD)
@@ -183,33 +183,79 @@ func (o *Observer) readLoop() {
 			continue
 		}
 
+		// Drain everything already available rather than a single read: a
+		// burst of writes can queue up several records before this loop
+		// gets scheduled, and processing them all before hashing anything
+		// means a close's generation snapshot reflects every write already
+		// known about, not just whichever ones happened to fit in one read.
+		o.hashAndEmit(o.drainNonBlocking(buf), buf)
+	}
+}
+
+// drainNonBlocking reads and processes every fanotify record currently
+// available without blocking, returning once none remain (or the stop pipe
+// becomes readable -- readLoop's own blocking poll notices that on its next
+// iteration, so this just needs to not spin past it). Used both for
+// readLoop's normal batch pickup and, from hashSettled, as the synchronous
+// catch-up that makes a close's generation check authoritative: any write
+// whose syscall has already returned has its notification already enqueued
+// here, whether or not this observer has gotten to it yet, so a
+// non-blocking drain right before trusting a hash is not a best-effort
+// peek, it is a real answer to "has anything else happened yet".
+func (o *Observer) drainNonBlocking(buf []byte) []pendingHash {
+	pollFDs := []unix.PollFd{
+		{Fd: int32(o.fanotifyFD), Events: unix.POLLIN},
+		{Fd: int32(o.stopR), Events: unix.POLLIN},
+	}
+
+	var pending []pendingHash
+	for {
+		_, err := unix.Poll(pollFDs, 0)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			return pending
+		}
+		if pollFDs[1].Revents&unix.POLLIN != 0 || pollFDs[0].Revents&unix.POLLIN == 0 {
+			return pending
+		}
+
 		n, err := unix.Read(o.fanotifyFD, buf)
 		if err != nil || n == 0 {
-			return
+			return pending
 		}
 
 		now := time.Now()
 		raw := parseEvents(buf, n, newKernelResolver(o.mountFD))
 		for i := range raw {
-			o.processRawEvent(&raw[i], now)
+			pending = append(pending, o.processRawEvent(&raw[i], now)...)
 		}
 	}
 }
 
-func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
+// pendingHash is a FileClose whose content hash still needs computing.
+// processRawEvent collects these instead of hashing them itself; see
+// hashAndEmit and hashSettled.
+type pendingHash struct {
+	target string
+	ts     time.Time
+}
+
+func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) []pendingHash {
 	if e.Mask&unix.FAN_Q_OVERFLOW != 0 {
 		o.overflow = true
-		return
+		return nil
 	}
 
 	// PID filter.
 	if o.cfg.PIDFilter > 0 && e.PID != o.cfg.PIDFilter {
-		return
+		return nil
 	}
 
 	// Path filter.
 	if o.cfg.PathFilter != "" && !strings.HasPrefix(e.Path, o.cfg.PathFilter) {
-		return
+		return nil
 	}
 
 	o.mu.Lock()
@@ -221,80 +267,33 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 		o.mu.Unlock()
 		e.Mask &^= unix.FAN_OPEN
 		if e.Mask == 0 {
-			return
+			return nil
 		}
 	} else {
 		o.mu.Unlock()
 	}
 
 	// Bump the per-path write generation before dispatching anything. A
-	// write-class event means the file's content just changed; the async
-	// hash goroutine below compares this value after its read to detect a
-	// second write landing in the TOCTOU window between the observed close
-	// and the goroutine actually reading the file. The observer's own
-	// hash-read is a FAN_OPEN only (already stripped above) and never
+	// write-class event means the file's content just changed; hashSettled
+	// snapshots this value before reading a close's content and compares it
+	// again afterward (via a synchronous catch-up drain, not just whatever
+	// this call happened to see), to detect a write landing in the TOCTOU
+	// window either before the read started or during it. The observer's
+	// own hash-read is a FAN_OPEN only (already stripped above) and never
 	// write-class, so it does not bump the generation.
-	var gen uint64
 	if e.Mask&(unix.FAN_CREATE|unix.FAN_MODIFY|unix.FAN_CLOSE_WRITE) != 0 {
 		o.mu.Lock()
 		if o.pathGeneration == nil {
 			o.pathGeneration = make(map[string]uint64)
 		}
 		o.pathGeneration[e.Path]++
-		gen = o.pathGeneration[e.Path]
 		o.mu.Unlock()
 	}
 
+	var pending []pendingHash
 	for _, actionType := range maskToActionTypes(e.Mask) {
 		if actionType == models.FileClose {
-			o.wg.Add(1)
-			go func(action models.ActionType, target string, timestamp time.Time, gen uint64) {
-				defer o.wg.Done()
-
-				o.mu.Lock()
-				if o.pendingHashOpens == nil {
-					o.pendingHashOpens = make(map[string]int)
-				}
-				o.pendingHashOpens[target]++
-				o.mu.Unlock()
-
-				digest, err := o.hashFile(target)
-
-				o.mu.Lock()
-				raced := o.pathGeneration[target] != gen
-				if err != nil {
-					// Hashing failed early enough that no FAN_OPEN was
-					// generated, so the pendingHashOpens bump won't be
-					// balanced by the self-open path; undo it here. On the
-					// success path (including a raced success) the read did
-					// open the file, so that decrement happens when the
-					// self-FAN_OPEN is processed.
-					o.pendingHashOpens[target]--
-					if o.pendingHashOpens[target] == 0 {
-						delete(o.pendingHashOpens, target)
-					}
-				}
-				o.mu.Unlock()
-
-				if err != nil || raced {
-					o.events <- models.GroundTruthEvent{
-						Timestamp:  timestamp,
-						ActionType: action,
-						Target:     target,
-						// No OutputHash: either hashing failed, or the file
-						// changed again before the hash could be trusted to
-						// reflect this specific close.
-					}
-					return
-				}
-
-				o.events <- models.GroundTruthEvent{
-					Timestamp:  timestamp,
-					ActionType: action,
-					Target:     target,
-					OutputHash: &digest,
-				}
-			}(actionType, e.Path, ts, gen)
+			pending = append(pending, pendingHash{target: e.Path, ts: ts})
 		} else {
 			o.events <- models.GroundTruthEvent{
 				Timestamp:  ts,
@@ -303,6 +302,85 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 			}
 		}
 	}
+	return pending
+}
+
+// hashAndEmit resolves every pending FileClose to a GroundTruthEvent and
+// emits it. It is a worklist rather than a single pass over pending because
+// hashSettled's own catch-up drain (see below) can discover further closes
+// -- for this path or another -- that arrived while a hash was being read;
+// those need the same treatment, with their own fresh generation snapshot,
+// not to be silently dropped.
+func (o *Observer) hashAndEmit(pending []pendingHash, buf []byte) {
+	for len(pending) > 0 {
+		p := pending[0]
+		pending = pending[1:]
+
+		digest, ok, more := o.hashSettled(p.target, buf)
+		pending = append(pending, more...)
+
+		event := models.GroundTruthEvent{
+			Timestamp:  p.ts,
+			ActionType: models.FileClose,
+			Target:     p.target,
+			// OutputHash left nil below when hashing failed, or the file
+			// changed again before the read could be trusted to reflect
+			// this specific close.
+		}
+		if ok {
+			event.OutputHash = &digest
+		}
+		o.events <- event
+	}
+}
+
+// hashSettled reads target's content and decides whether that read can be
+// trusted to represent the close it's being attached to. Hashing happens
+// synchronously here, in the single reader goroutine, specifically so the
+// generation check below is authoritative rather than racing an
+// independently-scheduled goroutine: after hashFile returns, it drains
+// (non-blocking) anything already sitting in the fanotify queue -- which,
+// by fanotify's own ordering guarantee, already includes the notification
+// for any write whose syscall has already completed, whether or not this
+// observer has processed it yet -- before comparing the path's generation
+// against the snapshot taken before the read. If they differ, the file was
+// touched again in that window and the read cannot be trusted.
+//
+// The returned pendingHash slice is whatever the catch-up drain discovered;
+// the caller (hashAndEmit) is responsible for resolving those too.
+func (o *Observer) hashSettled(target string, buf []byte) (digest string, ok bool, more []pendingHash) {
+	o.mu.Lock()
+	gen := o.pathGeneration[target]
+	if o.pendingHashOpens == nil {
+		o.pendingHashOpens = make(map[string]int)
+	}
+	o.pendingHashOpens[target]++
+	o.mu.Unlock()
+
+	d, err := o.hashFile(target)
+
+	more = o.drainNonBlocking(buf)
+
+	o.mu.Lock()
+	raced := o.pathGeneration[target] != gen
+	if err != nil {
+		// Hashing failed early enough that no FAN_OPEN was generated, so
+		// the pendingHashOpens bump won't be balanced by the self-open
+		// path; undo it here. On the success path (including a raced
+		// success) the read did open the file, so that decrement happens
+		// when the self-FAN_OPEN is processed -- very likely already, by
+		// the drain just above.
+		o.pendingHashOpens[target]--
+		if o.pendingHashOpens[target] == 0 {
+			delete(o.pendingHashOpens, target)
+		}
+	}
+	o.mu.Unlock()
+
+	if err != nil || raced {
+		return "", false, more
+	}
+	return d, true, more
 }
 
 // maskToActionTypes maps fanotify event mask bits to models.ActionType values.

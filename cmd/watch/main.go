@@ -56,6 +56,14 @@ type watchConfig struct {
 	Workspace    string
 	ProcFilter   string
 	EventBufSize int
+
+	// AncestryPending is true whenever runWatch will call the proc probe's
+	// SetRootPID once the root PID becomes known (exec-wrap or --root-pid).
+	// It tells the proc builder to start in ancestry-filtered mode from the
+	// moment its tracepoints attach, instead of the zero-value global mode --
+	// otherwise every process on the host would be recorded as top-level
+	// ground truth during the window before SetRootPID runs.
+	AncestryPending bool
 }
 
 type builderFunc func(watchConfig) (probe.Observer, error)
@@ -78,6 +86,7 @@ var probeBuilders = map[string]builderFunc{
 		return proc.New(proc.Config{
 			CommandFilter: cfg.ProcFilter,
 			EventBufSize:  cfg.EventBufSize,
+			DeferRootPID:  cfg.AncestryPending,
 		})
 	},
 }
@@ -148,6 +157,12 @@ func runWatch(opts watchOptions) error {
 	if os.Getuid() != 0 {
 		return errors.New("watch requires root (fanotify + eBPF); rerun with sudo")
 	}
+
+	// Ancestry scoping (exec-wrap or --root-pid) calls SetRootPID once the
+	// root PID is known, some time after the proc probe is built. Flag that
+	// now so the proc builder starts filtered from the outset instead of in
+	// global mode for that window -- see watchConfig.AncestryPending.
+	opts.cfg.AncestryPending = len(opts.agentArgs) > 0 || opts.rootPID != 0
 
 	// Build probes. The proc observer is held separately from the rest: its
 	// SetRootPID isn't part of the probe.Observer interface, and its Start

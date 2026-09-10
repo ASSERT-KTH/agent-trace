@@ -37,6 +37,13 @@ func runTier2Agent(t *testing.T) (models.Trajectory, models.GroundTruth) {
 
 	procObs, err := proc.New(proc.Config{
 		EventBufSize: 256,
+		// SetRootPID happens later, once the agent's PID is known. Without
+		// this, the probe sits in global mode (every host process treated
+		// as top-level) for the window between New and SetRootPID, and any
+		// concurrently-running process on the host -- including another
+		// package's tests under `go test ./...` -- leaks into this run's
+		// ground truth.
+		DeferRootPID: true,
 	})
 	if err != nil {
 		t.Fatalf("proc.New: %v", err)

@@ -241,7 +241,7 @@ func TestObserver_ShellChainStaysTopLevel(t *testing.T) {
 
 	nonce := fmt.Sprintf("agenttrace-shellchain-%d", time.Now().UnixNano())
 
-	obs, err := New(Config{EventBufSize: 512})
+	obs, err := New(Config{EventBufSize: 512, DeferRootPID: true})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -294,7 +294,7 @@ func TestObserver_NonShellIntermediateDemotesChildren(t *testing.T) {
 
 	nonce := fmt.Sprintf("agenttrace-nonshell-%d", time.Now().UnixNano())
 
-	obs, err := New(Config{EventBufSize: 512})
+	obs, err := New(Config{EventBufSize: 512, DeferRootPID: true})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

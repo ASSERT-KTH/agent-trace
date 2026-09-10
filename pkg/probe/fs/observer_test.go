@@ -179,9 +179,24 @@ func TestObserverIgnoresHashReadOpen(t *testing.T) {
 }
 
 // newHashSeamObserver builds an Observer wired for the pure-Go processRawEvent
-// path (no kernel), with a controllable content-hash function.
-func newHashSeamObserver(dir string, hashFile func(string) (string, error)) *Observer {
+// path (no kernel), with a controllable content-hash function. hashSettled
+// still polls fanotifyFD/stopR (as part of its catch-up drain) even in this
+// seam, so those get real, inert pipe fds -- never written to, so poll on
+// them always reports "nothing ready" -- rather than the zero value (fd 0,
+// i.e. stdin, whose poll behavior isn't something a test should depend on).
+func newHashSeamObserver(t *testing.T, dir string, hashFile func(string) (string, error)) *Observer {
+	t.Helper()
+	var pipeFDs [2]int
+	if err := unix.Pipe2(pipeFDs[:], unix.O_CLOEXEC); err != nil {
+		t.Fatalf("pipe2: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = unix.Close(pipeFDs[0])
+		_ = unix.Close(pipeFDs[1])
+	})
 	return &Observer{
+		fanotifyFD:       pipeFDs[0],
+		stopR:            pipeFDs[0],
 		events:           make(chan models.GroundTruthEvent, 16),
 		cfg:              Config{PathFilter: dir},
 		pendingHashOpens: map[string]int{},
@@ -189,6 +204,10 @@ func newHashSeamObserver(dir string, hashFile func(string) (string, error)) *Obs
 		hashFile:         hashFile,
 	}
 }
+
+// hashSeamBuf is a scratch read buffer big enough for these tests' synthetic
+// drains, which never actually have data to read (see newHashSeamObserver).
+func hashSeamBuf() []byte { return make([]byte, 4096) }
 
 func drainEvents(obs *Observer) []models.GroundTruthEvent {
 	var out []models.GroundTruthEvent
@@ -203,30 +222,27 @@ func drainEvents(obs *Observer) []models.GroundTruthEvent {
 }
 
 // TestObserver_RacedCloseDropsHash pins the Fix 5 TOCTOU behavior: if a second
-// write-class event for a path lands while the post-close hash goroutine is
-// still reading, the digest can't be trusted to reflect the observed close, so
-// the FileClose event is emitted with no OutputHash rather than a maybe-wrong one.
+// write-class event for a path lands while the close's content is being read,
+// the digest can't be trusted to reflect the observed close, so the FileClose
+// event is emitted with no OutputHash rather than a maybe-wrong one. Hashing
+// is synchronous now (see hashSettled), so the mock hashFile itself stands in
+// for "a write landed during the read" by bumping the generation as a side
+// effect, exactly like a concurrent write's fanotify event would.
 func TestObserver_RacedCloseDropsHash(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "raced.txt")
 
-	release := make(chan struct{})
-	entered := make(chan struct{})
-	obs := newHashSeamObserver(dir, func(string) (string, error) {
-		close(entered)
-		<-release // hold the "hash read" open across the second write
+	var obs *Observer
+	obs = newHashSeamObserver(t, dir, func(string) (string, error) {
+		obs.processRawEvent(&rawEvent{Mask: unix.FAN_MODIFY, PID: int32(os.Getpid()), Path: target}, time.Now())
 		return "sha256:stalehash", nil
 	})
 
-	// First FAN_CLOSE_WRITE: generation -> 1, dispatches the blocked goroutine.
-	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
-	<-entered
-
-	// Second write-class event for the same path: generation -> 2.
-	obs.processRawEvent(&rawEvent{Mask: unix.FAN_MODIFY, PID: int32(os.Getpid()), Path: target}, time.Now())
-
-	close(release)
-	obs.wg.Wait()
+	// FAN_CLOSE_WRITE: generation -> 1. The mock hashFile bumps it to 2
+	// mid-read, simulating the second write-class event landing while the
+	// content was being read.
+	pending := obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
+	obs.hashAndEmit(pending, hashSeamBuf())
 
 	var closes int
 	for _, e := range drainEvents(obs) {
@@ -249,12 +265,12 @@ func TestObserver_UnracedCloseKeepsHash(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "clean.txt")
 
-	obs := newHashSeamObserver(dir, func(string) (string, error) {
+	obs := newHashSeamObserver(t, dir, func(string) (string, error) {
 		return "sha256:goodhash", nil
 	})
 
-	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
-	obs.wg.Wait()
+	pending := obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
+	obs.hashAndEmit(pending, hashSeamBuf())
 
 	var got *models.GroundTruthEvent
 	for _, e := range drainEvents(obs) {
@@ -268,6 +284,50 @@ func TestObserver_UnracedCloseKeepsHash(t *testing.T) {
 	}
 	if got.OutputHash == nil || *got.OutputHash != "sha256:goodhash" {
 		t.Fatalf("unraced FileClose should carry the digest, got %v", got.OutputHash)
+	}
+}
+
+// TestObserver_BatchedCloseTrustsPostBatchGeneration pins the within-batch
+// fix directly: a single fanotify read can return several write-class
+// records for the same path in one call whenever writes land faster than
+// readLoop drains them, and processRawEvent handles them one at a time. If a
+// close's generation snapshot were captured inline, per event, it would miss
+// a bump from a later event already sitting in the very same batch, and the
+// eventual hash read (necessarily more current) would get wrongly flagged as
+// raced against that stale baseline. Snapshotting only in hashSettled, after
+// the whole batch has bumped pathGeneration, avoids that: the snapshot
+// always reflects every write-class event already known about, so the
+// close's own hash read (real disk state, standing in here for the mock) is
+// trusted and reported exactly once, not spuriously flagged as raced.
+func TestObserver_BatchedCloseTrustsPostBatchGeneration(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "batched.txt")
+
+	obs := newHashSeamObserver(t, dir, func(string) (string, error) {
+		return "sha256:final", nil
+	})
+
+	// Simulate one fanotify read returning both records together: both run
+	// through processRawEvent (bumping generation twice) before either's
+	// hash is resolved.
+	now := time.Now()
+	var pending []pendingHash
+	pending = append(pending, obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, now)...)
+	pending = append(pending, obs.processRawEvent(&rawEvent{Mask: unix.FAN_MODIFY, PID: int32(os.Getpid()), Path: target}, now)...)
+	obs.hashAndEmit(pending, hashSeamBuf())
+
+	var got *models.GroundTruthEvent
+	for _, e := range drainEvents(obs) {
+		if e.ActionType == models.FileClose {
+			ev := e
+			got = &ev
+		}
+	}
+	if got == nil {
+		t.Fatal("no FileClose event emitted")
+	}
+	if got.OutputHash == nil || *got.OutputHash != "sha256:final" {
+		t.Fatalf("batched close should trust its post-batch generation snapshot and carry the digest, got %v", got.OutputHash)
 	}
 }
 
