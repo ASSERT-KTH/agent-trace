@@ -98,7 +98,13 @@ func main() {
 	if !fileOnly {
 		// Tier 2.5 Semantic Gap test: agent executes a shell command (top-level)
 		// which spawns a subprocess (forensic).
-		wcArgs := []string{"wc", "-l", f2}
+		// We resolve the absolute path because the verifier now uses strict
+		// absolute-path matching for process execution to prevent substitution attacks.
+		wcPath, err := exec.LookPath("wc")
+		if err != nil {
+			log.Fatalf("failed to find wc in PATH: %v", err)
+		}
+		wcArgs := []string{wcPath, "-l", f2}
 		wcCmdLine := strings.Join(wcArgs, " ")
 		addEntry(models.ProcessExec, wcCmdLine)
 		// wc opens f2 for reading. Since fanotify tracks all file events,
