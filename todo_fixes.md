@@ -8,7 +8,7 @@ This document tracks the foundational audit of the Agent-Trace repository and th
 
 ### 2. Truncated eBPF Arguments & CI Drift (F2.1)
 * **The Problem:** The eBPF process probe captures command arguments using fixed 128-byte slots. An agent running `python -c "very long script..."` will have its payload truncated, blinding the verifier to a Substitution attack. Furthermore, the probe relies on local kernel headers instead of BPF CO-RE, causing random CI breakages when OS headers update.
-* **Status:** **[UP NEXT]** We need to refactor `proc.bpf.c` to use a dynamic Ring Buffer to capture variable-length `argv` arrays (up to 8KB) without truncation, and port it to CO-RE using `vmlinux.h` for cross-kernel portability.
+* **Status:** **[DONE]** We refactored `proc.bpf.c` to use BPF CO-RE (`vmlinux.h`), solving the CI header drift. We replaced the fixed-slots array with a dynamically sized NUL-terminated byte array streamed to userspace via `bpf_ringbuf`, which natively supports capturing up to 64 arguments or a maximum payload of 8KB, completely eliminating the 128-byte truncation blind spot.
 
 ### 3. The Output Hash Race Condition (F4.1)
 * **The Problem:** When an agent writes to a file, the `fanotify` observer waits for a 20ms `settleQuietWindow` after the file is closed before calculating the `OutputHash`. If the agent writes and then immediately deletes or renames the file within that 20ms window, the file is gone before the observer hashes it, causing a total loss of the output integrity evidence.
