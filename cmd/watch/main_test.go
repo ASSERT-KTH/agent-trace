@@ -37,7 +37,9 @@ func TestRunWatch_ExecWrapSuppressesRootSeesChild(t *testing.T) {
 	ws := t.TempDir()
 	out := filepath.Join(t.TempDir(), "ground_truth.json")
 	nonce := fmt.Sprintf("watch-3a-%d", time.Now().UnixNano())
-	script := "/bin/echo " + nonce + " & wait"
+	// sleep 0.1 prevents a scheduler race where the child shell runs and forks
+	// before the parent watch process has a chance to call SetRootPID.
+	script := "sleep 0.1 && /bin/echo " + nonce + " & wait"
 
 	opts := watchOptions{
 		cfg:       watchConfig{Workspace: ws, EventBufSize: 256},
