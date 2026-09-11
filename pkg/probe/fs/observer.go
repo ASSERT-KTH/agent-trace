@@ -76,6 +76,25 @@ type Observer struct {
 	// by itself enough to guarantee a hash reflects the final content.
 	pendingCloses map[string]*pendingClose
 
+	// lastWriteAt records, per path, the observer's local time when it last
+	// processed a write-class event (FAN_CREATE / FAN_MODIFY /
+	// FAN_CLOSE_WRITE) for that path. resolveSettled will not hash a pending
+	// close until this path has been quiet for settleDelay. "Survived one
+	// readLoop iteration untouched" is not sufficient on a loaded host,
+	// where an unrelated fanotify wakeup -- including the observer's own
+	// hash-read FAN_OPEN -- can end an iteration microseconds after it
+	// began, so an intermediate close in a write burst could otherwise be
+	// hashed against content the very next write truncates. Grows
+	// unboundedly for the observer's lifetime, like pathGeneration and
+	// pendingHashOpens.
+	lastWriteAt map[string]time.Time
+
+	// settleDelay is how long a path must be quiet (no write-class event,
+	// see lastWriteAt) before a pending close for it is hashed. Defaults to
+	// settleQuietWindow; left zero by tests that drive
+	// settleSnapshot/resolveSettled directly and want an immediate resolve.
+	settleDelay time.Duration
+
 	// hashFile computes the content hash for a closed file. Defaults to
 	// content.SHA256File; overridable in tests to control the read's outcome.
 	hashFile func(string) (string, error)
@@ -137,6 +156,8 @@ func New(cfg Config) (*Observer, error) {
 		pendingHashOpens: make(map[string]int),
 		pathGeneration:   make(map[string]uint64),
 		pendingCloses:    make(map[string]*pendingClose),
+		lastWriteAt:      make(map[string]time.Time),
+		settleDelay:      settleQuietWindow,
 		hashFile:         content.SHA256File,
 	}, nil
 }
@@ -176,16 +197,39 @@ func (o *Observer) Stop() error {
 	return nil
 }
 
-// settlePollMs bounds how long readLoop's blocking poll ever waits: a close
-// only ever gets hashed once it has survived one full iteration of this
-// loop untouched (see resolveSettled), so the loop needs to wake up
-// periodically to make that judgment even when nothing new arrives on the
-// fanotify fd. Correctness does not depend on this value -- a burst of
-// writes spanning many iterations just keeps superseding the pending close
-// for as many iterations as it takes -- it only trades off how quickly an
-// isolated close's hash is published against how often this loop wakes for
-// nothing.
-const settlePollMs = 20
+// settlePollMs bounds how long readLoop's poll ever blocks between settle
+// checks. readLoop must wake periodically to re-judge pending closes (see
+// resolveSettled) even when nothing new arrives on the fanotify fd, since a
+// close becomes eligible to hash purely by the passage of quiet time
+// (settleQuietWindow). Correctness does not depend on this value, but it
+// caps how much latency polling itself adds on top of settleQuietWindow
+// before a settled close's hash is actually published -- kept small so that
+// total latency (window + at most one poll period) stays comfortably under
+// the gap between an agent's distinct operations on a path (see
+// settleQuietWindow).
+const settlePollMs = 5
+
+// settleQuietWindow is the default settleDelay: a path must go this long
+// with no observed write-class event before a pending FileClose for it is
+// hashed. "Survived one readLoop iteration untouched" is not enough -- on a
+// loaded host an unrelated fanotify wakeup (including the observer's own
+// hash-read FAN_OPEN) can end an iteration microseconds after it began, so
+// an intermediate close in a write burst could otherwise be hashed against
+// content the next write immediately truncates (round 3's CI failure).
+//
+// The value is bounded on both sides: it must exceed the sub-millisecond
+// gaps within a single logical rewrite (so a burst never has a quiet gap
+// this long, and a hash is only ever published once the writer has actually
+// been starved for this whole window -- unlikely on any real scheduler, but
+// the failure mode to keep in mind when considering raising this further),
+// yet stay well below the gap between an agent's distinct operations on a
+// path -- once a file is written, closed, then (say) renamed or deleted a
+// short time later, its content is only hashable in the interval between.
+// Together with settlePollMs, total publish latency is window + at most one
+// poll period (~25ms), clearing the sub-millisecond burst-gap bound by
+// ~1000x while leaving ample room under cmd/simagent's 50ms fixture gap (see
+// TestObserver_CloseHashSurvivesQuickRename, the regression guard for this).
+const settleQuietWindow = 20 * time.Millisecond
 
 func (o *Observer) readLoop() {
 	defer close(o.stopped)
@@ -215,18 +259,21 @@ func (o *Observer) readLoop() {
 		}
 
 		// Snapshot before draining: resolveSettled uses this to tell which
-		// of today's pending closes survive this iteration untouched
-		// (identity-compared against pendingCloses afterward) and are
-		// therefore safe to hash now, versus ones this same iteration just
-		// registered or superseded, which need at least one more iteration
-		// to prove themselves. See resolveSettled and registerClose for why
-		// this -- not pathGeneration alone -- is what actually guarantees a
-		// published hash reflects the file's eventual final content.
+		// pending closes survive this iteration untouched (identity-compared
+		// against pendingCloses afterward), versus ones this same iteration
+		// just registered or superseded. Surviving is necessary but not
+		// sufficient -- resolveSettled additionally requires the path to
+		// have been quiet for settleDelay before it hashes, since an
+		// iteration can end almost immediately and a survivor can still be
+		// superseded moments later by a write that hasn't happened yet. See
+		// resolveSettled and registerClose for why this -- not pathGeneration
+		// alone -- guarantees a published hash reflects the file's eventual
+		// final content.
 		before := o.settleSnapshot()
 		if pollFDs[0].Revents&unix.POLLIN != 0 {
 			o.drainNonBlocking(buf)
 		}
-		o.resolveSettled(before, buf)
+		o.resolveSettled(before, buf, false)
 	}
 }
 
@@ -318,7 +365,11 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 		if o.pathGeneration == nil {
 			o.pathGeneration = make(map[string]uint64)
 		}
+		if o.lastWriteAt == nil {
+			o.lastWriteAt = make(map[string]time.Time)
+		}
 		o.pathGeneration[e.Path]++
+		o.lastWriteAt[e.Path] = ts
 		o.mu.Unlock()
 	}
 
@@ -378,23 +429,29 @@ func (o *Observer) settleSnapshot() map[string]*pendingClose {
 	return snap
 }
 
-// resolveSettled hashes and emits every entry in before that is still the
-// current pendingCloses entry for its path -- i.e. survived this settle
-// cycle without being superseded by a newer close (registerClose) -- and
-// removes it from pendingCloses. An entry that was superseded, or that no
-// longer matches (already resolved by a concurrent call), is left alone:
-// registerClose already emitted it, or a later cycle will judge it.
-func (o *Observer) resolveSettled(before map[string]*pendingClose, buf []byte) {
+// resolveSettled hashes and emits every entry in before that is both still
+// the current pendingCloses entry for its path (survived this settle cycle
+// without a newer close superseding it, see registerClose) and whose path
+// has been quiet -- no write-class event -- for at least settleDelay. Such
+// an entry is removed from pendingCloses and emitted, with an OutputHash
+// unless hashing failed or hashSettled's own check caught a write during
+// the read. An entry that was superseded, or already resolved by a
+// concurrent call, is left alone (registerClose emitted it). An entry that
+// is still current but not yet quiet is left in pendingCloses for a later
+// cycle to judge. force skips the quiet check: at shutdown no further write
+// can ever be observed, so every survivor is by definition settled.
+func (o *Observer) resolveSettled(before map[string]*pendingClose, buf []byte, force bool) {
 	for path, entry := range before {
 		o.mu.Lock()
 		current, ok := o.pendingCloses[path]
 		settled := ok && current == entry
-		if settled {
+		quiet := force || time.Since(o.lastWriteAt[path]) >= o.settleDelay
+		if settled && quiet {
 			delete(o.pendingCloses, path)
 		}
 		o.mu.Unlock()
 
-		if !settled {
+		if !settled || !quiet {
 			continue
 		}
 
@@ -406,7 +463,8 @@ func (o *Observer) resolveSettled(before map[string]*pendingClose, buf []byte) {
 			// OutputHash left nil below when hashing failed, or a write
 			// raced in during the read itself (hashSettled's own check);
 			// a write landing before this point would instead have gone
-			// through registerClose's supersession above.
+			// through registerClose's supersession above, or held this
+			// close back via the quiet check.
 		}
 		if ok {
 			event.OutputHash = &digest
@@ -419,7 +477,7 @@ func (o *Observer) resolveSettled(before map[string]*pendingClose, buf []byte) {
 // the observer is stopping, no more writes will ever be observed, so every
 // remaining entry is by definition settled.
 func (o *Observer) flushPendingCloses(buf []byte) {
-	o.resolveSettled(o.settleSnapshot(), buf)
+	o.resolveSettled(o.settleSnapshot(), buf, true)
 }
 
 // hashSettled reads target's content and decides whether that specific read

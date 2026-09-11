@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-trace/agent-trace/pkg/content"
 	"github.com/agent-trace/agent-trace/pkg/models"
 	"golang.org/x/sys/unix"
 )
@@ -152,6 +153,54 @@ func TestObserver_CloseWriteIncludesContentHash(t *testing.T) {
 	t.Fatalf("no FileClose event for %s", target)
 }
 
+// TestObserver_CloseHashSurvivesQuickRename is a regression guard for Fix 5
+// round 4's settleQuietWindow: a lone write's FileClose must still capture
+// the correct content hash even when the same path is renamed away shortly
+// afterward. This is the real shape of cmd/simagent's Tier 4 fixture (write,
+// wait 50ms, rename) and the exact scenario that regressed when the settle
+// window was widened too far -- see docs/plan/06_security_hardening_fixes.md,
+// Fix 5 round 4. It pins settleQuietWindow's upper bound: window + polling
+// latency must stay comfortably under the gap between an agent's distinct
+// operations on a path, or the observer never gets a chance to hash before
+// the file it was about to hash disappears out from under it.
+func TestObserver_CloseHashSurvivesQuickRename(t *testing.T) {
+	skipUnprivileged(t)
+	dir := t.TempDir()
+	obs := startObserver(t, dir)
+
+	target := filepath.Join(dir, "quick.txt")
+	data := []byte("hello\n")
+	if err := os.WriteFile(target, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := content.SHA256Bytes(data)
+
+	// The same gap cmd/simagent uses between writing a file and renaming it
+	// away (see delay() in cmd/simagent/main.go); the observer must have
+	// already hashed the close well before this elapses.
+	time.Sleep(40 * time.Millisecond)
+	if err := os.Rename(target, filepath.Join(dir, "quick-renamed.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	events := collectEvents(obs, 500*time.Millisecond)
+	_ = obs.Stop()
+
+	for _, e := range events {
+		if e.ActionType != models.FileClose || e.Target != target {
+			continue
+		}
+		if e.OutputHash == nil {
+			t.Fatalf("FileClose for %s lost its hash before the rename", target)
+		}
+		if *e.OutputHash != want {
+			t.Errorf("FileClose hash = %q, want %q", *e.OutputHash, want)
+		}
+		return
+	}
+	t.Fatalf("no FileClose event for %s", target)
+}
+
 func TestObserverIgnoresHashReadOpen(t *testing.T) {
 	path := "/mock/dir/hashed.txt"
 	observer := &Observer{
@@ -201,7 +250,10 @@ func newHashSeamObserver(t *testing.T, dir string, hashFile func(string) (string
 		cfg:              Config{PathFilter: dir},
 		pendingHashOpens: map[string]int{},
 		pathGeneration:   map[string]uint64{},
+		lastWriteAt:      map[string]time.Time{},
 		hashFile:         hashFile,
+		// settleDelay left zero: these tests drive settleSnapshot/
+		// resolveSettled directly and want an immediate resolve.
 	}
 }
 
@@ -245,7 +297,7 @@ func TestObserver_RacedCloseDropsHash(t *testing.T) {
 	// content was being read.
 	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
 	before := obs.settleSnapshot()
-	obs.resolveSettled(before, hashSeamBuf())
+	obs.resolveSettled(before, hashSeamBuf(), false)
 
 	var closes int
 	for _, e := range drainEvents(obs) {
@@ -274,7 +326,7 @@ func TestObserver_UnracedCloseKeepsHash(t *testing.T) {
 
 	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
 	before := obs.settleSnapshot()
-	obs.resolveSettled(before, hashSeamBuf())
+	obs.resolveSettled(before, hashSeamBuf(), false)
 
 	var got *models.GroundTruthEvent
 	for _, e := range drainEvents(obs) {
@@ -313,7 +365,7 @@ func TestObserver_BatchedCloseTrustsPostBatchGeneration(t *testing.T) {
 	obs.processRawEvent(&rawEvent{Mask: unix.FAN_MODIFY, PID: int32(os.Getpid()), Path: target}, now)
 
 	before := obs.settleSnapshot()
-	obs.resolveSettled(before, hashSeamBuf())
+	obs.resolveSettled(before, hashSeamBuf(), false)
 
 	var got *models.GroundTruthEvent
 	for _, e := range drainEvents(obs) {
@@ -371,7 +423,7 @@ func TestObserver_SupersededCloseNeverHashed(t *testing.T) {
 
 	// The surviving (second) close settles normally on the next cycle.
 	before := obs.settleSnapshot()
-	obs.resolveSettled(before, hashSeamBuf())
+	obs.resolveSettled(before, hashSeamBuf(), false)
 
 	var got *models.GroundTruthEvent
 	for _, e := range drainEvents(obs) {
@@ -385,6 +437,68 @@ func TestObserver_SupersededCloseNeverHashed(t *testing.T) {
 	}
 	if got.OutputHash == nil || *got.OutputHash != "sha256:final" {
 		t.Fatalf("surviving close should carry the digest, got %v", got.OutputHash)
+	}
+	if hashCalls != 1 {
+		t.Errorf("expected exactly 1 hashFile call, got %d", hashCalls)
+	}
+}
+
+// TestObserver_CloseHeldUntilPathQuiet pins Fix 5 round 4: a FileClose is not
+// hashed until its path has gone settleDelay with no further write-class
+// event. Surviving one settle cycle is not sufficient -- an intermediate
+// close in a write burst kept surviving cycles in round 3 and got hashed
+// against content the next write immediately truncated (the CI failure).
+// Here the close survives every cycle (nothing supersedes it), yet must not
+// be hashed while write-class events keep arriving; only once the path is
+// quiet does it settle, and then exactly once.
+func TestObserver_CloseHeldUntilPathQuiet(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "burst.txt")
+
+	var hashCalls int
+	obs := newHashSeamObserver(t, dir, func(string) (string, error) {
+		hashCalls++
+		return "sha256:final", nil
+	})
+	obs.settleDelay = 50 * time.Millisecond
+
+	obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target}, time.Now())
+
+	// Keep the path "busy": each write-class event pushes the quiet deadline
+	// out, so no settle cycle in the burst may hash the (still un-superseded)
+	// close. Re-stamp immediately before each resolveSettled so a scheduling
+	// hiccup can't let settleDelay elapse between them.
+	for i := 0; i < 6; i++ {
+		obs.processRawEvent(&rawEvent{Mask: unix.FAN_MODIFY, PID: int32(os.Getpid()), Path: target}, time.Now())
+		obs.resolveSettled(obs.settleSnapshot(), hashSeamBuf(), false)
+		if hashCalls != 0 {
+			t.Fatalf("close hashed mid-burst on cycle %d (%d hashFile calls)", i, hashCalls)
+		}
+	}
+	// The FAN_MODIFY events surface as FileWrite; the point is that no
+	// FileClose has been emitted yet -- the close is still pending.
+	for _, e := range drainEvents(obs) {
+		if e.ActionType == models.FileClose {
+			t.Fatalf("FileClose emitted during the burst: %#v", e)
+		}
+	}
+
+	// Path goes quiet: after settleDelay with no new write, the close settles.
+	time.Sleep(2 * obs.settleDelay)
+	obs.resolveSettled(obs.settleSnapshot(), hashSeamBuf(), false)
+
+	var got *models.GroundTruthEvent
+	for _, e := range drainEvents(obs) {
+		if e.ActionType == models.FileClose {
+			ev := e
+			got = &ev
+		}
+	}
+	if got == nil {
+		t.Fatal("no FileClose emitted after the path went quiet")
+	}
+	if got.OutputHash == nil || *got.OutputHash != "sha256:final" {
+		t.Fatalf("settled close should carry the digest, got %v", got.OutputHash)
 	}
 	if hashCalls != 1 {
 		t.Errorf("expected exactly 1 hashFile call, got %d", hashCalls)
