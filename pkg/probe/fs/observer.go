@@ -351,7 +351,8 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 	}
 
 	// Bump the per-path write generation before dispatching anything. A
-	// write-class event means the file's content just changed; hashSettled
+	// write-class event (now including FAN_OPEN to catch open(O_TRUNC) TOCTOU
+	// races) means the file's content just changed, or is about to. hashSettled
 	// snapshots this value before reading a close's content and compares it
 	// again afterward (via a synchronous catch-up drain, not just whatever
 	// this call happened to see), to detect a write landing in the TOCTOU
@@ -359,9 +360,8 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 	// proves nothing changed during one specific read -- it says nothing
 	// about writes that haven't happened yet -- which is why registerClose
 	// below carries the real guarantee for closes. The observer's own
-	// hash-read is a FAN_OPEN only (already stripped above) and never
-	// write-class, so it does not bump the generation.
-	if e.Mask&(unix.FAN_CREATE|unix.FAN_MODIFY|unix.FAN_CLOSE_WRITE) != 0 {
+	// hash-read FAN_OPEN is already stripped above and never reaches here.
+	if e.Mask&(unix.FAN_CREATE|unix.FAN_MODIFY|unix.FAN_CLOSE_WRITE|unix.FAN_OPEN) != 0 {
 		o.mu.Lock()
 		if o.pathGeneration == nil {
 			o.pathGeneration = make(map[string]uint64)
