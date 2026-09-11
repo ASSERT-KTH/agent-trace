@@ -19,14 +19,14 @@ An agent produces a **trajectory**: a JSON log of the actions it claims to have 
 
 A trajectory is **faithful** only when every entry corroborates and nothing is unrecorded.
 
-Matching (`pkg/matching`) is greedy closest-timestamp, one-to-one within a configurable time window, and normalizes command paths so a bare command name (`ls`) corroborates an absolute execve path (`/usr/bin/ls`) by basename.
+Matching (`pkg/matching`) is greedy closest-timestamp, one-to-one within a configurable time window, and enforces strict absolute-path equality for process execution to prevent substitution attacks (e.g., masquerading `/tmp/ls` as `ls`).
 
 Verification is built up in tiers of increasing probe coverage:
 
 - **Tier 0** — core data model, matching, and verification logic, exercised with synthetic trajectories and ground truth.
 - **Tier 1** — filesystem probe (`pkg/probe/fs`, via `fanotify`).
 - **Tier 2** — process probe (`pkg/probe/proc`, via an in-kernel eBPF program on `execve`/`exit_group`/`sched_process_exit`), capturing exec argv, exit codes, and in-kernel timestamps.
-- **Tier 4 (in progress)** — filesystem content verification: SHA-256 of a file's final contents is recorded at `FAN_CLOSE_WRITE`.
+- **Tier 4 (in progress)** — filesystem content verification: SHA-256 of a file's initial contents is recorded at `FAN_OPEN` and final contents at `FAN_CLOSE_WRITE`.
 
 Tier 3 (network), remaining Tier 4 evidence capture, Tier 5 (attack simulation), and Tier 6 (real-agent integration) are planned.
 
