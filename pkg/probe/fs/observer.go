@@ -198,7 +198,7 @@ func (o *Observer) Overflow() bool {
 // Start begins reading fanotify events in a background goroutine.
 func (o *Observer) Start() {
 	if o.cfg.PathFilter != "" {
-		filepath.Walk(o.cfg.PathFilter, func(path string, info os.FileInfo, err error) error {
+		_ = filepath.Walk(o.cfg.PathFilter, func(path string, info os.FileInfo, err error) error {
 			if err == nil && info.Mode().IsRegular() {
 				if h, err := content.SHA256File(path); err == nil {
 					o.shadowHashes[path] = h
@@ -645,7 +645,7 @@ func (o *Observer) hashSettledFD(target string, buf []byte, pathFD int) (digest 
 		readFD, openErr := unix.Open(procPath, unix.O_RDONLY, 0)
 		if openErr == nil {
 			d, err = o.hashFD(readFD)
-			unix.Close(readFD)
+			_ = unix.Close(readFD)
 		} else {
 			err = openErr
 		}
