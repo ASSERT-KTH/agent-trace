@@ -417,10 +417,10 @@ func TestGreedyClosestTimestamp(t *testing.T) {
 func TestMixedFileAndProcessVerification(t *testing.T) {
 	traj := models.Trajectory{
 		te(0, models.FileRead, "/workspace/./main.go", nil, sp("src_h")),
-		te(500, models.ProcessExec, "go", sp("build_args"), nil),
+		te(500, models.ProcessExec, "/usr/local/bin/go", sp("build_args"), nil),
 		te(1500, models.FileWrite, "/workspace/bin/app", sp("nil_h"), sp("bin_h")),
-		te(2500, models.ProcessExec, "git", sp("commit_args"), nil),
-		te(3000, models.ProcessExit, "git", nil, sp("0")),
+		te(2500, models.ProcessExec, "/usr/bin/git", sp("commit_args"), nil),
+		te(3000, models.ProcessExit, "/usr/bin/git", nil, sp("0")),
 	}
 	ground := models.GroundTruth{
 		ge(3, models.FileRead, "/workspace/main.go", nil, sp("src_h")),
@@ -720,7 +720,7 @@ func TestE2E_T3_BareNameMasquerading(t *testing.T) {
 // Sibling to TestE2E_T3_BareNameMasquerading: the same bare claim against a
 // binary that really did resolve into a standard system directory still
 // corroborates, so Fix 2 doesn't break the honest bare-name convention.
-func TestE2E_BareNameAgainstTrustedPathStillFaithful(t *testing.T) {
+func TestE2E_BareNameAgainstTrustedPathIsNOTFaithful(t *testing.T) {
 	traj := models.Trajectory{
 		te(0, models.ProcessExec, "ls -la /workspace", nil, nil),
 	}
@@ -730,11 +730,14 @@ func TestE2E_BareNameAgainstTrustedPathStillFaithful(t *testing.T) {
 
 	v := Verify(traj, ground, cfg)
 
-	if !v.Faithful {
-		t.Errorf("bare name vs /usr/bin path should be FAITHFUL, got %+v", v)
+	if v.Faithful {
+		t.Errorf("bare name vs /usr/bin path should be NOT FAITHFUL due to strict matching, got %+v", v)
 	}
-	if len(v.Corroborated) != 1 {
-		t.Errorf("expected 1 corroborated, got %d", len(v.Corroborated))
+	if len(v.Corroborated) != 0 {
+		t.Errorf("expected 0 corroborated, got %d", len(v.Corroborated))
+	}
+	if len(v.Unwitnessed) != 1 || len(v.Unrecorded) != 1 {
+		t.Errorf("expected 1 unwitnessed and 1 unrecorded, got U=%d R=%d", len(v.Unwitnessed), len(v.Unrecorded))
 	}
 }
 

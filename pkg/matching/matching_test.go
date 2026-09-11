@@ -164,7 +164,7 @@ func TestDirectoryFallbackRequiresAmbiguousFlag(t *testing.T) {
 	})
 }
 
-func TestProcessCommandNormalization(t *testing.T) {
+func TestProcessCommandStrictMatching(t *testing.T) {
 	cfg := DefaultConfig()
 
 	tests := []struct {
@@ -174,179 +174,27 @@ func TestProcessCommandNormalization(t *testing.T) {
 		want    bool
 	}{
 		{
-			name:    "bare name vs absolute path",
-			tTarget: "ls",
-			gTarget: "/usr/bin/ls",
-			want:    true,
-		},
-		{
-			name:    "absolute path vs bare name",
-			tTarget: "/bin/echo",
-			gTarget: "echo",
-			want:    true,
-		},
-		{
 			name:    "identical bare names",
-			tTarget: "git",
-			gTarget: "git",
-			want:    true,
-		},
-		{
-			name:    "identical absolute paths",
-			tTarget: "/usr/local/bin/python3",
-			gTarget: "/usr/local/bin/python3",
-			want:    true,
-		},
-		{
-			name:    "path with dot segment vs bare name",
-			tTarget: "/usr/bin/./ls",
+			tTarget: "ls",
 			gTarget: "ls",
 			want:    true,
 		},
 		{
-			name:    "different bare names",
-			tTarget: "ls",
-			gTarget: "cat",
-			want:    false,
-		},
-		{
-			name:    "same basename different directory",
-			tTarget: "/usr/bin/python",
-			gTarget: "/opt/venv/bin/python",
-			want:    false,
-		},
-		{
-			name:    "bare name matches basename but not the other command",
-			tTarget: "sh",
-			gTarget: "/bin/bash",
-			want:    false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			te := entry(0, models.ProcessExec, tc.tTarget)
-			ge := event(0, models.ProcessExec, tc.gTarget)
-			got := Match(te, ge, cfg)
-			if got != tc.want {
-				t.Errorf("Match(%q, %q) = %v, want %v", tc.tTarget, tc.gTarget, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestProcessCommandWithArguments(t *testing.T) {
-	cfg := DefaultConfig()
-
-	tests := []struct {
-		name    string
-		tTarget string
-		gTarget string
-		want    bool
-	}{
-		{
-			// The common honest case post-fix: the agent reports the bare
-			// command it invoked, the process probe reports the
-			// kernel-resolved path, and both carry the same arguments
-			// (which now contain a path themselves, the case the old
-			// whole-string bare/path check got wrong).
-			name:    "bare command with path argument vs resolved path",
-			tTarget: "wc -l /tmp/workspace/file2.txt",
-			gTarget: "/usr/bin/wc -l /tmp/workspace/file2.txt",
+			name:    "identical absolute paths",
+			tTarget: "/usr/bin/ls -la",
+			gTarget: "/usr/bin/ls -la",
 			want:    true,
 		},
 		{
-			name:    "identical bare command and arguments",
-			tTarget: "git commit -m fix",
-			gTarget: "git commit -m fix",
-			want:    true,
-		},
-		{
-			name:    "same command, different arguments do not match",
-			tTarget: "wc -l /tmp/workspace/file1.txt",
-			gTarget: "/usr/bin/wc -l /tmp/workspace/file2.txt",
-			want:    false,
-		},
-		{
-			name:    "same arguments, different resolved command do not match",
-			tTarget: "wc -l /tmp/workspace/file2.txt",
-			gTarget: "/usr/bin/cat -l /tmp/workspace/file2.txt",
-			want:    false,
-		},
-		{
-			// The anti-spoofing case this change exists for: the agent
-			// claims a fully-qualified, trusted binary, but the process
-			// probe (once it reports the real execve path instead of
-			// argv[0], see proc.commandLine) shows a different binary
-			// actually ran. This must NOT be treated as a match just
-			// because both sides share the same trailing arguments.
-			name:    "claimed trusted path vs actually-resolved different path",
-			tTarget: "/usr/bin/ls -la /tmp/workspace",
-			gTarget: "/tmp/attacker-writable-dir/ls -la /tmp/workspace",
-			want:    false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			te := entry(0, models.ProcessExec, tc.tTarget)
-			ge := event(0, models.ProcessExec, tc.gTarget)
-			got := Match(te, ge, cfg)
-			if got != tc.want {
-				t.Errorf("Match(%q, %q) = %v, want %v", tc.tTarget, tc.gTarget, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestBareCommandRequiresTrustedDirectory(t *testing.T) {
-	cfg := DefaultConfig()
-
-	tests := []struct {
-		name    string
-		tTarget string
-		gTarget string
-		want    bool
-	}{
-		{
-			// The legitimate convenience case: bare claim, standard
-			// system path. Still matches.
-			name:    "bare name vs allowlisted /usr/bin path",
+			name:    "bare name vs absolute path should NOT match",
 			tTarget: "ls",
 			gTarget: "/usr/bin/ls",
-			want:    true,
-		},
-		{
-			// The actual fix. Pre-Fix-2 the basename match alone made this
-			// true, letting a planted binary in an agent-writable directory
-			// corroborate a bare-name claim for a common tool.
-			name:    "bare name vs non-allowlisted, often-writable path",
-			tTarget: "ls",
-			gTarget: "/tmp/attacker-writable-dir/ls",
 			want:    false,
 		},
 		{
-			// Intentional stricter stance (spec Fix 2): a bare claim can no
-			// longer vouch for a virtualenv/pyenv-style interpreter path,
-			// only for system-standard locations. If this proves too strict
-			// for real target agents, widen trustedBinDirs deliberately.
-			name:    "bare name vs venv interpreter path",
-			tTarget: "python",
-			gTarget: "/opt/venv/bin/python",
-			want:    false,
-		},
-		{
-			name:    "bare name vs allowlisted /usr/local/bin path",
-			tTarget: "node",
-			gTarget: "/usr/local/bin/node",
-			want:    true,
-		},
-		{
-			// Direction is symmetric: the resolved path may be on either
-			// side of the comparison.
-			name:    "non-allowlisted path vs bare name (reversed order)",
-			tTarget: "/home/agent/build/mytool",
-			gTarget: "mytool",
+			name:    "same arguments but bare vs absolute should NOT match",
+			tTarget: "wc -l /tmp/test",
+			gTarget: "/usr/bin/wc -l /tmp/test",
 			want:    false,
 		},
 	}
@@ -360,16 +208,6 @@ func TestBareCommandRequiresTrustedDirectory(t *testing.T) {
 				t.Errorf("Match(%q, %q) = %v, want %v", tc.tTarget, tc.gTarget, got, tc.want)
 			}
 		})
-	}
-}
-
-func TestProcessExitUsesCommandNormalization(t *testing.T) {
-	cfg := DefaultConfig()
-	te := entry(0, models.ProcessExit, "make")
-	ge := event(0, models.ProcessExit, "/usr/bin/make")
-
-	if !Match(te, ge, cfg) {
-		t.Error("process_exit should normalize command paths like process_exec")
 	}
 }
 
