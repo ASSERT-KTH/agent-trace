@@ -25,6 +25,14 @@ func event(offset time.Duration, action models.ActionType, target string) models
 	}
 }
 
+// ambiguousEvent is like event but sets PathIsAmbiguous, marking Target as a
+// directory-only resolution (see resolveEventPath's DFID-only fallback).
+func ambiguousEvent(offset time.Duration, action models.ActionType, target string) models.GroundTruthEvent {
+	e := event(offset, action, target)
+	e.PathIsAmbiguous = true
+	return e
+}
+
 func TestMatchExact(t *testing.T) {
 	cfg := DefaultConfig()
 	te := entry(0, models.FileWrite, "/tmp/test.txt")
@@ -130,6 +138,30 @@ func TestFilePathNormalization(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDirectoryFallbackRequiresAmbiguousFlag pins Fix 6: the directory-
+// covers-file leniency in targetsMatch must only apply when the ground
+// truth is a genuinely ambiguous (kernel-merged, DFID-only) record. Before
+// this fix, any ground-truth event whose Target happened to equal a
+// directory could corroborate any filename inside it.
+func TestDirectoryFallbackRequiresAmbiguousFlag(t *testing.T) {
+	cfg := DefaultConfig()
+	te := entry(0, models.FileWrite, "/workspace/src/main.go")
+
+	t.Run("ambiguous directory-only ground truth still matches", func(t *testing.T) {
+		ge := ambiguousEvent(0, models.FileWrite, "/workspace/src")
+		if !Match(te, ge, cfg) {
+			t.Error("an ambiguous directory-level ground truth should corroborate a file inside it")
+		}
+	})
+
+	t.Run("exactly-resolved directory target does not match", func(t *testing.T) {
+		ge := event(0, models.FileWrite, "/workspace/src")
+		if Match(te, ge, cfg) {
+			t.Error("a non-ambiguous ground-truth event equal to a directory must not corroborate an unrelated file inside it")
+		}
+	})
 }
 
 func TestProcessCommandNormalization(t *testing.T) {

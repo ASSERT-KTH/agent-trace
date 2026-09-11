@@ -1,6 +1,7 @@
 package models
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 	"time"
@@ -178,6 +179,74 @@ func TestRoundTripNilHashes(t *testing.T) {
 	if decoded.OutputHash != nil {
 		t.Errorf("expected nil output_hash, got %v", *decoded.OutputHash)
 	}
+}
+
+// TestGroundTruthEventRoundTripPathIsAmbiguous pins the wire behavior of
+// PathIsAmbiguous (Fix 6): true must round-trip as true, and the omitempty
+// default (false, or the field absent entirely, as legacy ground truth
+// files predating Fix 6 will have) must decode as false, never as some
+// zero-value ambiguity that could accidentally enable the directory-fallback
+// leniency in matching.targetsMatch.
+func TestGroundTruthEventRoundTripPathIsAmbiguous(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+
+	t.Run("true survives the round trip", func(t *testing.T) {
+		original := GroundTruthEvent{
+			Timestamp:       now,
+			ActionType:      FileWrite,
+			Target:          "/workspace/src",
+			PathIsAmbiguous: true,
+		}
+
+		data, err := json.Marshal(original)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+
+		var decoded GroundTruthEvent
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if !decoded.PathIsAmbiguous {
+			t.Error("expected path_is_ambiguous to survive the round trip as true")
+		}
+	})
+
+	t.Run("false is omitted and decodes back to false", func(t *testing.T) {
+		original := GroundTruthEvent{
+			Timestamp:  now,
+			ActionType: FileWrite,
+			Target:     "/workspace/src/main.go",
+		}
+
+		data, err := json.Marshal(original)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if bytes.Contains(data, []byte("path_is_ambiguous")) {
+			t.Errorf("expected path_is_ambiguous to be omitted when false, got %s", data)
+		}
+
+		var decoded GroundTruthEvent
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if decoded.PathIsAmbiguous {
+			t.Error("expected path_is_ambiguous to decode back to false")
+		}
+	})
+
+	t.Run("legacy JSON without the field decodes to false", func(t *testing.T) {
+		legacy := []byte(`{"timestamp":"2026-01-01T00:00:00Z","action_type":"file_write","target":"/workspace/src"}`)
+
+		var decoded GroundTruthEvent
+		if err := json.Unmarshal(legacy, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if decoded.PathIsAmbiguous {
+			t.Error("legacy ground truth without path_is_ambiguous must decode to false, not true")
+		}
+	})
 }
 
 func TestParseTrajectory(t *testing.T) {

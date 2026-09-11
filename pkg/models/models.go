@@ -34,6 +34,15 @@ type GroundTruthEvent struct {
 	// the tracked root process or one of its direct children. A nil value is
 	// legacy data and is treated as top-level for backward compatibility.
 	IsTopLevel *bool `json:"is_top_level,omitempty"`
+	// PathIsAmbiguous is true when the probe could only resolve this event
+	// to its containing directory, not the specific file within it (a
+	// fanotify DFID-only record with no name, produced when the kernel
+	// merges events). Matching applies a lenient directory-covers-file
+	// fallback only when this is true; an event with a normally-resolved,
+	// specific path must match exactly. Absent/false means "this path is
+	// exact," which is both the common case and the safe default for any
+	// producer that doesn't set it.
+	PathIsAmbiguous bool `json:"path_is_ambiguous,omitempty"`
 }
 
 func (e *TrajectoryEntry) Validate() error {
