@@ -13,7 +13,7 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type bpfEvent struct {
+type bpfEventHdr struct {
 	_           structs.HostLayout
 	Pid         uint32
 	Kind        uint32
@@ -23,9 +23,16 @@ type bpfEvent struct {
 	ExitCode    int32
 	HasExitCode uint8
 	IsToplevel  uint8
-	Filename    [256]int8
-	Args        [1536]int8
 	_           [2]byte
+	FilenameLen uint32
+	ArgsSize    uint32
+}
+
+type bpfExecScratch struct {
+	_        structs.HostLayout
+	Hdr      bpfEventHdr
+	Filename [256]int8
+	Args     [16384]int8
 }
 
 type bpfProcInfo struct {

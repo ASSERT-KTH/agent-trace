@@ -1,0 +1,15 @@
+{
+  "yolo-except-commit": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/yolo-commit.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

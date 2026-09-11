@@ -2,26 +2,22 @@ package proc
 
 import "testing"
 
-// makeArgSlots encodes values into the fixed-width slot layout the BPF
-// program writes (argSlot bytes per entry, NUL-terminated), matching what
-// commandLine expects to parse. Unused slots stay zeroed.
-func makeArgSlots(values ...string) []int8 {
-	buf := make([]int8, argSlot*MaxArgsForTest)
+// makeArgsBytes encodes values into the contiguous NUL-terminated byte slice
+// layout the BPF program now writes, matching what commandLine expects to parse.
+func makeArgsBytes(values ...string) []byte {
+	var buf []byte
 	for i, v := range values {
 		if i >= MaxArgsForTest {
 			break
 		}
-		for j := 0; j < len(v) && j < argSlot-1; j++ {
-			buf[i*argSlot+j] = int8(v[j])
-		}
+		buf = append(buf, []byte(v)...)
+		buf = append(buf, 0)
 	}
 	return buf
 }
 
-// MaxArgsForTest mirrors MAX_ARGS in proc.bpf.c. Kept separate (rather than
-// exported from the BPF-generated code) since the slot count is a C-side
-// constant with no corresponding Go symbol.
-const MaxArgsForTest = 12
+// MaxArgsForTest mirrors MAX_ARGS in proc.bpf.c.
+const MaxArgsForTest = 64
 
 func TestCommandLine_UsesResolvedFilenameNotArgv0(t *testing.T) {
 	tests := []struct {
@@ -77,7 +73,7 @@ func TestCommandLine_UsesResolvedFilenameNotArgv0(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := commandLine(tc.filename, makeArgSlots(tc.argv...), tc.nargs)
+			got := commandLine(tc.filename, makeArgsBytes(tc.argv...), tc.nargs)
 			if got != tc.want {
 				t.Errorf("commandLine(%q, %v, %d) = %q, want %q",
 					tc.filename, tc.argv, tc.nargs, got, tc.want)

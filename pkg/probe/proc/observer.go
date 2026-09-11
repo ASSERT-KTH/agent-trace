@@ -25,17 +25,13 @@ import (
 // The -I flag points clang at the multiarch UAPI headers (<asm/types.h>);
 // x86_64-linux-gnu matches both local dev and the x86_64 CI runner. Add other
 // triplets here if the build ever moves to a different architecture.
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpfel,bpfeb -type event bpf proc.bpf.c -- -I/usr/include/x86_64-linux-gnu
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpfel,bpfeb -type event_hdr -type exec_scratch bpf proc.bpf.c -- -I/usr/include/x86_64-linux-gnu
 
 // Kind values mirror the KIND_* constants in proc.bpf.c.
 const (
 	kindExec uint32 = 0
 	kindExit uint32 = 1
 )
-
-// argSlot mirrors ARG_SLOT in proc.bpf.c: the BPF program writes each argv
-// entry into its own fixed-width slot, and this side rejoins them.
-const argSlot = 128
 
 // Config controls the observer's behavior.
 type Config struct {
@@ -237,8 +233,9 @@ func (o *Observer) Stop() error {
 func (o *Observer) readLoop() {
 	defer close(o.stopped)
 
-	var raw bpfEvent
-	eventSize := binary.Size(raw)
+	var hdr bpfEventHdr
+	hdrSize := binary.Size(hdr)
+	const filenameLen = 256 // Matches FILENAME_LEN in proc.bpf.c
 
 	for {
 		record, err := o.reader.Read()
@@ -248,21 +245,21 @@ func (o *Observer) readLoop() {
 			}
 			continue
 		}
-		if len(record.RawSample) < eventSize {
+		if len(record.RawSample) < hdrSize {
 			continue
 		}
-		if err := binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &raw); err != nil {
+		if err := binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &hdr); err != nil {
 			continue
 		}
 		// The root process's initial exec can happen before SetRootPID installs
 		// the ancestry filter. The root itself is the controller, not an agent
 		// action, so never expose its events as verification-grade events.
-		if o.cfg.PIDFilter > 0 && int32(raw.Pid) == o.cfg.PIDFilter {
+		if o.cfg.PIDFilter > 0 && int32(hdr.Pid) == o.cfg.PIDFilter {
 			continue
 		}
 
 		var actionType models.ActionType
-		switch raw.Kind {
+		switch hdr.Kind {
 		case kindExec:
 			actionType = models.ProcessExec
 		case kindExit:
@@ -270,7 +267,23 @@ func (o *Observer) readLoop() {
 		default:
 			continue
 		}
-		target := commandLine(cString(raw.Filename[:]), raw.Args[:], raw.Nargs)
+
+		// Extract filename and args from the payload
+		var fnBytes, argsBytes []byte
+		if len(record.RawSample) >= hdrSize+filenameLen {
+			fnBytes = record.RawSample[hdrSize : hdrSize+filenameLen]
+			
+			argsStart := hdrSize + filenameLen
+			argsEnd := argsStart + int(hdr.ArgsSize)
+			if argsEnd > len(record.RawSample) {
+				argsEnd = len(record.RawSample)
+			}
+			if argsStart < argsEnd {
+				argsBytes = record.RawSample[argsStart:argsEnd]
+			}
+		}
+
+		target := commandLine(cString(fnBytes), argsBytes, hdr.Nargs)
 		if target == "" {
 			continue
 		}
@@ -278,15 +291,15 @@ func (o *Observer) readLoop() {
 			continue
 		}
 
-		isTopLevel := raw.IsToplevel == 1
+		isTopLevel := hdr.IsToplevel == 1
 		event := models.GroundTruthEvent{
-			Timestamp:  time.Unix(0, raw.TsNs+o.bootOffsetNs),
+			Timestamp:  time.Unix(0, hdr.TsNs+o.bootOffsetNs),
 			ActionType: actionType,
 			Target:     target,
 			IsTopLevel: &isTopLevel,
 		}
-		if raw.HasExitCode != 0 {
-			code := raw.ExitCode
+		if hdr.HasExitCode != 0 {
+			code := hdr.ExitCode
 			event.ExitCode = &code
 		}
 
@@ -313,17 +326,16 @@ func (o *Observer) readLoop() {
 // path carries the same caller-controlled-string weakness the filename read
 // exists to avoid; it should be rare in practice (filename capture failing
 // on a successful execve would itself be unusual).
-func commandLine(filename string, args []int8, nargs uint32) string {
-	slots := len(args) / argSlot
-	if n := int(nargs); n < slots {
-		slots = n
-	}
-
-	argv := make([]string, 0, slots)
-	for i := 0; i < slots; i++ {
-		if s := cString(args[i*argSlot : (i+1)*argSlot]); s != "" {
-			argv = append(argv, s)
+func commandLine(filename string, args []byte, nargs uint32) string {
+	var argv []string
+	start := 0
+	for i := uint32(0); i < nargs && start < len(args); i++ {
+		end := start
+		for end < len(args) && args[end] != 0 {
+			end++
 		}
+		argv = append(argv, string(args[start:end]))
+		start = end + 1
 	}
 
 	cmd := filename
@@ -342,15 +354,14 @@ func commandLine(filename string, args []int8, nargs uint32) string {
 	return strings.Join(parts, " ")
 }
 
-// cString converts a NUL-terminated C char array (int8 on this platform) into a
-// Go string.
-func cString(b []int8) string {
+// cString converts a NUL-terminated byte slice into a Go string.
+func cString(b []byte) string {
 	buf := make([]byte, 0, len(b))
 	for _, c := range b {
 		if c == 0 {
 			break
 		}
-		buf = append(buf, byte(c))
+		buf = append(buf, c)
 	}
 	return string(buf)
 }

@@ -1,106 +1,51 @@
 // SPDX-License-Identifier: GPL-2.0
 //go:build ignore
 
-// Tier 2 process probe: independent ground truth for subprocess spawns.
-//
-// Three tracepoints feed a single ring buffer:
-//   * syscalls/sys_enter_execve     -> KIND_EXEC, carries argv
-//   * syscalls/sys_enter_exit_group -> caches the exit code, emits nothing
-//   * sched/sched_process_exit      -> KIND_EXIT, replays the argv (and exit
-//                                      code, if seen) cached at exec
-//
-// The argv captured at exec time is stashed in a hash map keyed by TGID so the
-// exit event can report the same command string, giving the verifier a
-// symmetric (exec, exit) pair without reading task_struct via CO-RE.
-//
-// Exit code: sched_process_exit's tracepoint args don't carry it (that needs
-// task_struct via CO-RE). Instead we hook sys_enter_exit_group, which is what
-// glibc's exit()/_exit() funnel through in a multi-threaded process, and cache
-// the code onto the same execs record. A process killed by an uncaught signal
-// never calls exit_group, so has_exit_code stays 0 for it -- that's a real
-// "unknown", not a fabricated 0.
-//
-// argv is stored as MAX_ARGS fixed-width slots rather than packed end-to-end.
-// Packing needs a running offset, and a helper write at a variable offset is
-// exactly the pattern the BPF verifier struggles to bound through an unrolled
-// loop. With slots, every offset is i * ARG_SLOT, a compile-time constant once
-// the loop is unrolled, so the program verifies without bounds gymnastics. The
-// cost is a fixed buffer and a per-argument length cap; userspace rejoins the
-// slots into a command line.
-//
-// Legacy (non-CO-RE) style on purpose: it needs only <linux/bpf.h> and libbpf's
-// bpf_helpers.h, so no vmlinux.h has to be generated or committed.
-
-#include <linux/bpf.h>
+#include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 
 char LICENSE[] SEC("license") = "GPL";
 
-#define ARG_SLOT 128                    // max bytes per argv entry, including NUL
-#define MAX_ARGS 12                     // argv entries captured
-#define ARGS_BUF (MAX_ARGS * ARG_SLOT)  // total argv bytes carried per event
-#define FILENAME_LEN 256                // max bytes for the resolved execve path
+#define MAX_ARGS 64
+#define MAX_ARGS_BYTES 8192
+#define FILENAME_LEN 256
 
 #define KIND_EXEC 0
 #define KIND_EXIT 1
 
-// SHELL_PATHS (Fix 3b): binaries whose children inherit top-level status
-// from them, so a chain of pure shell re-execs (sh -c 'bash -c "cmd"')
-// keeps its payload verification-grade instead of demoting it to
-// forensic-only. is_shell is re-evaluated for every non-root PID at every
-// execve: a shell that execs a real tool stops vouching for that tool's
-// children, and a non-shell that execs a shell starts. The ancestry root is
-// exempt -- its is_shell=1 is a synthetic "my children are agent actions"
-// marker, not a claim that the root is itself a shell.
-//
-// Deliberately does NOT include /usr/bin/env: env does not fork, it
-// re-execs the same PID into its target, so env's own is_shell status is
-// irrelevant; whatever it ultimately execs into is classified on its own
-// merits at that execve.
-//
-// path_is(fn, literal) exact-matches the NUL-terminated string in fn
-// against a compile-time string literal as a fully unrolled fixed-length
-// compare. Every index into `literal` folds to a constant; fn is the
-// 256-byte e->filename, so fn[i] for i < sizeof(literal) is always in
-// bounds. sizeof(literal) includes the NUL, and bpf_probe_read_user_str
-// writes that NUL into fn, so this checks fn's terminator too -- an exact
-// match, not a prefix.
-#define path_is(fn, literal) __extension__({                       \
-	int _match = 1;                                            \
-	_Pragma("clang loop unroll(full)")                        \
-	for (unsigned _i = 0; _i < sizeof(literal); _i++)          \
-		_match &= ((fn)[_i] == (literal)[_i]);             \
-	_match;                                                    \
+#define path_is(fn, literal) __extension__({ \
+	int _match = 1; \
+	_Pragma("clang loop unroll(full)") \
+	for (unsigned _i = 0; _i < sizeof(literal); _i++) \
+		_match &= ((fn)[_i] == (literal)[_i]); \
+	_match; \
 })
 
-static __always_inline int filename_is_shell(const char *fn)
-{
+static __always_inline int filename_is_shell(const char *fn) {
 	return path_is(fn, "/bin/sh")   || path_is(fn, "/usr/bin/sh")   ||
 	       path_is(fn, "/bin/bash") || path_is(fn, "/usr/bin/bash") ||
 	       path_is(fn, "/bin/dash") || path_is(fn, "/usr/bin/dash") ||
 	       path_is(fn, "/bin/zsh")  || path_is(fn, "/usr/bin/zsh");
 }
 
-// struct event carries both `filename` and `args`. `filename` is the path
-// the kernel actually resolved and loaded (ctx->filename on sys_enter_execve),
-// independent of whatever the caller chose to put in argv. `args` still
-// carries argv, including argv[0], for display/forensics, but argv[0] must
-// never be trusted as the process's identity: a caller can execve() a binary
-// while passing an arbitrary, unrelated argv[0] (classic process
-// masquerading), so userspace builds the reported command identity from
-// `filename`, not from args[0]. See commandLine() in observer.go.
-struct event {
+struct event_hdr {
 	__u32 pid;
 	__u32 kind;
-	__u32 nargs;        // number of populated argv slots
-	__s64 ts_ns;         // bpf_ktime_get_ns() at exec, or at exit for KIND_EXIT
-	__s32 exit_code;     // valid only if has_exit_code is set
+	__u32 nargs;
+	__s64 ts_ns;
+	__s32 exit_code;
 	__u8  has_exit_code;
 	__u8  is_toplevel;
-	char filename[FILENAME_LEN]; // resolved execve path; kernel-observed, not caller-supplied
-	char args[ARGS_BUF];
+	__u32 filename_len;
+	__u32 args_size;
 };
 
+struct exec_scratch {
+	struct event_hdr hdr;
+	char filename[FILENAME_LEN];
+	char args[MAX_ARGS_BYTES * 2]; // Padded to satisfy verifier worst-case offset+size bounds
+};
 
 struct proc_info {
 	__u8 is_shell;
@@ -114,8 +59,6 @@ struct {
 	__type(value, struct proc_info);
 } tracked_pids SEC(".maps");
 
-// User space sets this to 1 if we are tracking a specific process tree (PIDFilter > 0).
-// If 0, we track everything system-wide and treat all as top-level.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -129,10 +72,6 @@ static __always_inline __u8 get_use_pid_filter() {
 	return val ? *val : 0;
 }
 
-// root_pid_map holds the ancestry root PID (PIDFilter). Fix 3b needs it to
-// exempt the root from per-execve is_shell re-evaluation: the root's
-// is_shell=1 is synthetic and must not be downgraded when the root execs a
-// non-shell agent binary.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -151,24 +90,20 @@ struct {
 	__uint(max_entries, 1 << 20); // 1 MiB
 } events SEC(".maps");
 
-// Per-CPU scratch space: struct event is far too large for the 512-byte BPF
-// stack, so it is assembled here and then copied out.
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, struct event);
+	__type(value, struct exec_scratch);
 } heap SEC(".maps");
 
-// argv captured at execve, keyed by TGID, replayed on process exit.
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 4096);
 	__type(key, __u32);
-	__type(value, struct event);
+	__type(value, struct exec_scratch);
 } execs SEC(".maps");
 
-// tracepoint/syscalls/sys_enter_execve argument layout (stable ABI).
 struct sys_enter_execve_ctx {
 	__u64 pad;
 	__s32 syscall_nr;
@@ -178,7 +113,6 @@ struct sys_enter_execve_ctx {
 	const char *const *envp;
 };
 
-// tracepoint/sched/sched_process_exit argument layout (stable ABI).
 struct sched_process_exit_ctx {
 	__u64 pad;
 	char comm[16];
@@ -186,17 +120,12 @@ struct sched_process_exit_ctx {
 	__s32 prio;
 };
 
-// tracepoint/syscalls/sys_enter_exit_group argument layout (stable ABI).
-// error_code is the raw syscall arg: reported by the kernel as size 8
-// (syscall args are always captured as a padded long), so read it as u64
-// and take the low 32 bits.
 struct sys_enter_exit_group_ctx {
 	__u64 pad;
 	__s32 syscall_nr;
 	__u32 pad2;
 	__u64 error_code;
 };
-
 
 struct task_newtask_ctx {
 	__u64 pad;
@@ -220,15 +149,6 @@ int handle_fork(struct task_newtask_ctx *ctx)
 		return 0;
 
 	struct proc_info child = {0};
-	// A new process is verification-grade (top-level) only if its parent is
-	// on the top-level shell chain: the parent must be itself top-level AND
-	// a shell. Fix 3b keeps is_shell current per-execve and seeds the
-	// ancestry root as {is_shell=1, is_toplevel=1}, so this propagates
-	// through a chain of shell re-execs and breaks at the first non-shell.
-	// A non-shell tool like `make`, reached as a direct child of a shell,
-	// is itself top-level but its own children go back to forensic-only --
-	// even when `make` runs its recipe through /bin/sh, because that shell
-	// was forked by non-top-level `make`.
 	if (p->is_shell && p->is_toplevel) {
 		child.is_toplevel = 1;
 	} else {
@@ -245,89 +165,80 @@ int handle_execve(struct sys_enter_execve_ctx *ctx)
 	__u32 zero = 0;
 	__u32 pid = bpf_get_current_pid_tgid() >> 32;
 
-	struct event *e = bpf_map_lookup_elem(&heap, &zero);
+	struct exec_scratch *e = bpf_map_lookup_elem(&heap, &zero);
 	if (!e)
 		return 0;
 
-	e->pid = pid;
-	e->kind = KIND_EXEC;
-	e->ts_ns = bpf_ktime_get_ns();
-	e->exit_code = 0;
-	e->has_exit_code = 0;
+	e->hdr.pid = pid;
+	e->hdr.kind = KIND_EXEC;
+	e->hdr.ts_ns = bpf_ktime_get_ns();
+	e->hdr.exit_code = 0;
+	e->hdr.has_exit_code = 0;
+	e->hdr.args_size = 0;
+	e->hdr.nargs = 0;
 
-	// Read the kernel-resolved path directly, not from argv. This is the
-	// field the verifier trusts as the process's real identity, and the
-	// Fix 3b shell classification below keys off it, so it must be resolved
-	// before the ancestry bookkeeping.
 	e->filename[0] = '\0';
-	bpf_probe_read_user_str(&e->filename, sizeof(e->filename), ctx->filename);
+	long fn_len = bpf_probe_read_user_str(&e->filename, sizeof(e->filename), ctx->filename);
+	e->hdr.filename_len = (fn_len > 0) ? fn_len : 0;
 
 	if (get_use_pid_filter()) {
 		struct proc_info *p = bpf_map_lookup_elem(&tracked_pids, &pid);
 		if (!p)
 			return 0;
-		e->is_toplevel = p->is_toplevel;
-		// Fix 3b: keep is_shell current with the binary actually running,
-		// re-evaluated at every execve (both upgrade and downgrade). p
-		// points into the hash map's own storage, so this write lands in
-		// place. The ancestry root is exempt -- its is_shell=1 is synthetic
-		// and downgrading it would demote every real agent subprocess.
+		e->hdr.is_toplevel = p->is_toplevel;
 		__u32 root = get_root_pid();
 		if (root && pid != root)
 			p->is_shell = filename_is_shell(e->filename) ? 1 : 0;
 	} else {
-		e->is_toplevel = 1;
+		e->hdr.is_toplevel = 1;
 	}
 
+	__u32 args_size = 0;
 	__u32 nargs = 0;
-	int done = 0;
 
 #pragma clang loop unroll(full)
 	for (int i = 0; i < MAX_ARGS; i++) {
-		// i * ARG_SLOT is constant per unrolled iteration, so both this
-		// store and the helper read below are trivially in-bounds.
-		e->args[i * ARG_SLOT] = '\0';
-		if (done)
-			continue;
-
 		const char *argp = NULL;
-		if (bpf_probe_read_user(&argp, sizeof(argp), &ctx->argv[i]) || !argp) {
-			done = 1;
-			continue;
-		}
+		if (bpf_probe_read_user(&argp, sizeof(argp), &ctx->argv[i]) || !argp)
+			break;
 
-		long n = bpf_probe_read_user_str(&e->args[i * ARG_SLOT], ARG_SLOT, argp);
-		if (n <= 0) {
-			e->args[i * ARG_SLOT] = '\0';
-			done = 1;
-			continue;
-		}
-		nargs = i + 1;
+		__u32 offset = args_size & (MAX_ARGS_BYTES - 1);
+		
+		long n = bpf_probe_read_user_str(&e->args[offset], MAX_ARGS_BYTES, argp);
+		if (n <= 0)
+			break;
+
+		args_size += n;
+		nargs++;
+
+		if (args_size >= MAX_ARGS_BYTES)
+			break;
 	}
-	e->nargs = nargs;
+
+	e->hdr.args_size = args_size;
+	e->hdr.nargs = nargs;
 
 	bpf_map_update_elem(&execs, &pid, e, BPF_ANY);
-	bpf_ringbuf_output(&events, e, sizeof(*e), 0);
+
+	__u32 out_size = sizeof(struct event_hdr) + FILENAME_LEN + args_size;
+	if (out_size > sizeof(struct exec_scratch))
+		out_size = sizeof(struct exec_scratch);
+
+	bpf_ringbuf_output(&events, e, out_size, 0);
 	return 0;
 }
 
-// sys_enter_exit_group fires before the process is actually gone, so it just
-// updates the cached execs record in place; sched_process_exit does the
-// emitting. Fires only for processes that exit via exit()/_exit() rather than
-// an uncaught signal.
 SEC("tracepoint/syscalls/sys_enter_exit_group")
 int handle_exit_group(struct sys_enter_exit_group_ctx *ctx)
 {
 	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
 
-	struct event *cached = bpf_map_lookup_elem(&execs, &tgid);
+	struct exec_scratch *cached = bpf_map_lookup_elem(&execs, &tgid);
 	if (!cached)
 		return 0;
 
-	// This is a pointer into the map's own storage (BPF_MAP_TYPE_HASH), so
-	// the write lands directly in the cached record without a re-update.
-	cached->exit_code = (__s32)ctx->error_code;
-	cached->has_exit_code = 1;
+	cached->hdr.exit_code = (__s32)ctx->error_code;
+	cached->hdr.has_exit_code = 1;
 	return 0;
 }
 
@@ -338,25 +249,25 @@ int handle_exit(struct sched_process_exit_ctx *ctx)
 	__u32 tgid = id >> 32;
 	__u32 tid = (__u32)id;
 
-	// Only the thread-group leader's exit means the process is gone.
 	if (tgid != tid)
 		return 0;
 
-	struct event *cached = bpf_map_lookup_elem(&execs, &tgid);
+	struct exec_scratch *cached = bpf_map_lookup_elem(&execs, &tgid);
 	if (!cached)
 		return 0;
 
 	__u32 zero = 0;
-	struct event *e = bpf_map_lookup_elem(&heap, &zero);
+	struct exec_scratch *e = bpf_map_lookup_elem(&heap, &zero);
 	if (e) {
-		// sizeof(struct event) is past clang's inline-memcpy threshold, so
-		// copy the cached exec record out of the map with a helper. This
-		// carries over exit_code/has_exit_code set by handle_exit_group, if
-		// it fired.
 		bpf_probe_read_kernel(e, sizeof(*e), cached);
-		e->kind = KIND_EXIT;
-		e->ts_ns = bpf_ktime_get_ns(); // actual exit time, not the exec time
-		bpf_ringbuf_output(&events, e, sizeof(*e), 0);
+		e->hdr.kind = KIND_EXIT;
+		e->hdr.ts_ns = bpf_ktime_get_ns();
+		
+		__u32 out_size = sizeof(struct event_hdr) + FILENAME_LEN + e->hdr.args_size;
+		if (out_size > sizeof(struct exec_scratch))
+			out_size = sizeof(struct exec_scratch);
+		
+		bpf_ringbuf_output(&events, e, out_size, 0);
 	}
 
 	bpf_map_delete_elem(&execs, &tgid);
@@ -364,5 +275,4 @@ int handle_exit(struct sched_process_exit_ctx *ctx)
 		bpf_map_delete_elem(&tracked_pids, &tgid);
 	}
 	return 0;
-
 }
