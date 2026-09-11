@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -56,6 +57,20 @@ type Observer struct {
 	overflow         bool // true if FAN_Q_OVERFLOW was seen
 	pendingHashOpens map[string]int
 	shadowHashes     map[string]string
+
+	// shadowHashesByInode is shadowHashes' companion index, keyed by the
+	// file's (device, inode) instead of its path. A path-keyed lookup alone
+	// misses a file that was renamed since it was last hashed: FAN_OPEN on
+	// the new name won't find an entry under the old one, and the two
+	// FAN_MOVED_FROM/FAN_MOVED_TO events for the rename are not reliably
+	// resolvable back to the same path anyway (a fanotify DFID_NAME record
+	// can resolve ambiguously to just the parent directory -- see rawEvent.
+	// Ambiguous). Device+inode identifies the underlying file regardless of
+	// what it's currently named, since a rename never changes it, so this
+	// index survives renames for free. Populated in hashSettledFD from the
+	// fd it just hashed; consulted in processRawEvent as a fallback when a
+	// FAN_OPEN's path isn't (yet, or ever again) a key in shadowHashes.
+	shadowHashesByInode map[inodeKey]string
 
 	// pathGeneration counts write-class events (FAN_CREATE / FAN_MODIFY /
 	// FAN_CLOSE_WRITE) seen per path. hashSettled snapshots the generation
@@ -150,20 +165,21 @@ func New(cfg Config) (*Observer, error) {
 	}
 
 	return &Observer{
-		fanotifyFD:       fd,
-		mountFD:          mountFD,
-		stopR:            pipeFDs[0],
-		stopW:            pipeFDs[1],
-		events:           make(chan models.GroundTruthEvent, cfg.EventBufSize),
-		stopped:          make(chan struct{}),
-		cfg:              cfg,
-		pendingHashOpens: make(map[string]int),
-		shadowHashes:     make(map[string]string),
-		pathGeneration:   make(map[string]uint64),
-		pendingCloses:    make(map[string]*pendingClose),
-		lastWriteAt:      make(map[string]time.Time),
-		settleDelay:      settleQuietWindow,
-		hashFD:           content.SHA256FD,
+		fanotifyFD:          fd,
+		mountFD:             mountFD,
+		stopR:               pipeFDs[0],
+		stopW:               pipeFDs[1],
+		events:              make(chan models.GroundTruthEvent, cfg.EventBufSize),
+		stopped:             make(chan struct{}),
+		cfg:                 cfg,
+		pendingHashOpens:    make(map[string]int),
+		shadowHashes:        make(map[string]string),
+		shadowHashesByInode: make(map[inodeKey]string),
+		pathGeneration:      make(map[string]uint64),
+		pendingCloses:       make(map[string]*pendingClose),
+		lastWriteAt:         make(map[string]time.Time),
+		settleDelay:         settleQuietWindow,
+		hashFD:              content.SHA256FD,
 	}, nil
 }
 
@@ -186,6 +202,9 @@ func (o *Observer) Start() {
 			if err == nil && info.Mode().IsRegular() {
 				if h, err := content.SHA256File(path); err == nil {
 					o.shadowHashes[path] = h
+					if st, ok := info.Sys().(*syscall.Stat_t); ok {
+						o.shadowHashesByInode[inodeKey{dev: uint64(st.Dev), ino: st.Ino}] = h
+					}
 				}
 			}
 			return nil
@@ -399,19 +418,83 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 				PathIsAmbiguous: e.Ambiguous,
 			}
 			if actionType == models.FileOpen {
-				o.mu.Lock()
-				if h, ok := o.shadowHashes[e.Path]; ok {
-					hashCopy := h
-					event.InputHash = &hashCopy
-				} else {
-					emptyHash := "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-					event.InputHash = &emptyHash
-				}
-				o.mu.Unlock()
+				hash := o.lookupShadowHash(e.Path, e.HandleType, e.HandleData)
+				event.InputHash = &hash
 			}
 			o.events <- event
 		}
 	}
+}
+
+// emptyFileHash is the InputHash attached to a FAN_OPEN when the observer
+// has no record of the file's content -- a newly created file, or one this
+// observer never saw settle before the open.
+const emptyFileHash = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// lookupShadowHash resolves the InputHash to attach to a FAN_OPEN on path.
+// It tries shadowHashes by path first, then falls back to
+// shadowHashesByInode via the event's file handle. The fallback matters
+// across a rename: shadowHashes is keyed by the path a file had when it was
+// last hashed (at its FAN_CLOSE_WRITE settle), and a FAN_MOVED_FROM/TO pair
+// is not reliably resolvable back to that same path (a fanotify DFID_NAME
+// record can degrade to just the parent directory under load -- see
+// rawEvent.Ambiguous), so a rename can silently orphan the path-keyed entry.
+// Device+inode identifies the file regardless of what it's currently named.
+func (o *Observer) lookupShadowHash(path string, handleType int32, handleData []byte) string {
+	o.mu.Lock()
+	if h, ok := o.shadowHashes[path]; ok {
+		o.mu.Unlock()
+		return h
+	}
+	mountFD := o.mountFD
+	o.mu.Unlock()
+
+	if handleData != nil && mountFD >= 0 {
+		if key, ok := inodeKeyFromHandle(mountFD, handleType, handleData); ok {
+			o.mu.Lock()
+			h, ok := o.shadowHashesByInode[key]
+			if ok {
+				// Keep the fast path warm for subsequent opens of this path.
+				o.shadowHashes[path] = h
+			}
+			o.mu.Unlock()
+			if ok {
+				return h
+			}
+		}
+	}
+
+	return emptyFileHash
+}
+
+// inodeKey identifies a file by device and inode number, stable across
+// renames (unlike a path) and distinct across bind mounts / filesystems
+// (unlike inode number alone).
+type inodeKey struct {
+	dev uint64
+	ino uint64
+}
+
+// inodeKeyFromHandle resolves a fanotify file handle to the (device, inode)
+// identifying the file it currently names, via a short-lived O_PATH fd.
+func inodeKeyFromHandle(mountFD int, handleType int32, handleData []byte) (inodeKey, bool) {
+	fh := unix.NewFileHandle(handleType, handleData)
+	fd, err := unix.OpenByHandleAt(mountFD, fh, unix.O_RDONLY|unix.O_PATH)
+	if err != nil {
+		return inodeKey{}, false
+	}
+	defer func() { _ = unix.Close(fd) }()
+	return inodeKeyFromFD(fd)
+}
+
+// inodeKeyFromFD reads the (device, inode) pair identifying the file behind
+// fd.
+func inodeKeyFromFD(fd int) (inodeKey, bool) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return inodeKey{}, false
+	}
+	return inodeKey{dev: uint64(stat.Dev), ino: stat.Ino}, true
 }
 
 // registerClose records a newly observed FileClose for path as the pending
@@ -590,6 +673,14 @@ func (o *Observer) hashSettledFD(target string, buf []byte, pathFD int) (digest 
 
 	o.mu.Lock()
 	o.shadowHashes[target] = d
+	if pathFD >= 0 {
+		if key, ok := inodeKeyFromFD(pathFD); ok {
+			if o.shadowHashesByInode == nil {
+				o.shadowHashesByInode = make(map[inodeKey]string)
+			}
+			o.shadowHashesByInode[key] = d
+		}
+	}
 	o.mu.Unlock()
 
 	return d, true

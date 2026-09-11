@@ -262,16 +262,17 @@ func newHashSeamObserver(t *testing.T, dir string, hashFD func(int) (string, err
 		_ = unix.Close(pipeFDs[1])
 	})
 	return &Observer{
-		fanotifyFD:       pipeFDs[0],
-		mountFD:          -1,
-		stopR:            pipeFDs[0],
-		events:           make(chan models.GroundTruthEvent, 16),
-		cfg:              Config{PathFilter: dir},
-		pendingHashOpens: map[string]int{},
-		pathGeneration:   map[string]uint64{},
-		shadowHashes:     map[string]string{},
-		lastWriteAt:      map[string]time.Time{},
-		hashFD:         hashFD,
+		fanotifyFD:          pipeFDs[0],
+		mountFD:             -1,
+		stopR:               pipeFDs[0],
+		events:              make(chan models.GroundTruthEvent, 16),
+		cfg:                 Config{PathFilter: dir},
+		pendingHashOpens:    map[string]int{},
+		pathGeneration:      map[string]uint64{},
+		shadowHashes:        map[string]string{},
+		shadowHashesByInode: map[inodeKey]string{},
+		lastWriteAt:         map[string]time.Time{},
+		hashFD:              hashFD,
 		// settleDelay left zero: these tests drive settleSnapshot/
 		// resolveSettled directly and want an immediate resolve.
 	}
@@ -637,6 +638,64 @@ func TestObserver_RenameFile(t *testing.T) {
 	// directory only; on ext4/xfs, DFID_NAME gives the full path.
 	assertHasEventInDir(t, events, models.FileRename, src)
 	assertHasEventInDir(t, events, models.FileRename, dst)
+}
+
+// TestObserver_OpenAfterRenameCarriesShadowHash pins the F4.2 rename fix: a
+// FAN_OPEN on a file right after it was renamed must still carry the file's
+// real content as InputHash, not the empty-file fallback. shadowHashes alone
+// can't survive the rename -- it's keyed by the path the file had when it
+// was last hashed (here, at Start's pre-cache walk), and the rename's
+// FAN_MOVED_FROM/FAN_MOVED_TO events aren't reliably resolvable back to that
+// same path (see rawEvent.Ambiguous) -- so this exercises the
+// shadowHashesByInode fallback keyed on the file's (device, inode) instead.
+func TestObserver_OpenAfterRenameCarriesShadowHash(t *testing.T) {
+	skipUnprivileged(t)
+	dir := t.TempDir()
+
+	src := filepath.Join(dir, "before-rename.txt")
+	dst := filepath.Join(dir, "after-rename.txt")
+	data := []byte("carried across rename")
+	if err := os.WriteFile(src, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Started only after the file exists, so its hash is populated via
+	// Start's pre-cache walk rather than a FAN_CLOSE_WRITE settle -- the
+	// same shadowHashes entry a longer-running observer would already have
+	// for any file it saw close before this rename.
+	obs := startObserver(t, dir)
+
+	if err := os.Rename(src, dst); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	_, _ = f.Read(buf)
+	_ = f.Close()
+
+	events := collectEvents(obs, 500*time.Millisecond)
+	_ = obs.Stop()
+
+	wantHash := content.SHA256Bytes(data)
+	var found bool
+	for _, e := range events {
+		if e.ActionType == models.FileOpen && e.Target == dst {
+			found = true
+			if e.InputHash == nil || *e.InputHash != wantHash {
+				t.Errorf("FileOpen InputHash = %v, want %s", e.InputHash, wantHash)
+			}
+		}
+	}
+	if !found {
+		for _, e := range events {
+			t.Logf("  %s %s", e.ActionType, e.Target)
+		}
+		t.Fatalf("no FileOpen event for %s", dst)
+	}
 }
 
 func TestObserver_OpenFile(t *testing.T) {
