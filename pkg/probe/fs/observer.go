@@ -108,7 +108,8 @@ type Observer struct {
 // cycle untouched, so a new pendingClose value is always allocated rather
 // than mutating one in place.
 type pendingClose struct {
-	ts time.Time // this close's own observed timestamp
+	ts        time.Time // this close's own observed timestamp
+	ambiguous bool      // see rawEvent.Ambiguous / models.GroundTruthEvent.PathIsAmbiguous
 }
 
 // New creates an Observer. The caller must call Start to begin receiving
@@ -375,12 +376,13 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 
 	for _, actionType := range maskToActionTypes(e.Mask) {
 		if actionType == models.FileClose {
-			o.registerClose(e.Path, ts)
+			o.registerClose(e.Path, ts, e.Ambiguous)
 		} else {
 			o.events <- models.GroundTruthEvent{
-				Timestamp:  ts,
-				ActionType: actionType,
-				Target:     e.Path,
+				Timestamp:       ts,
+				ActionType:      actionType,
+				Target:          e.Path,
+				PathIsAmbiguous: e.Ambiguous,
 			}
 		}
 	}
@@ -396,13 +398,13 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 // This, not pathGeneration, is what actually guarantees a hash the observer
 // does attach reflects the eventual final content: a close is never hashed
 // until it has survived a full settle cycle with nothing superseding it.
-func (o *Observer) registerClose(path string, ts time.Time) {
+func (o *Observer) registerClose(path string, ts time.Time, ambiguous bool) {
 	o.mu.Lock()
 	if o.pendingCloses == nil {
 		o.pendingCloses = make(map[string]*pendingClose)
 	}
 	superseded, existed := o.pendingCloses[path]
-	o.pendingCloses[path] = &pendingClose{ts: ts}
+	o.pendingCloses[path] = &pendingClose{ts: ts, ambiguous: ambiguous}
 	o.mu.Unlock()
 
 	if existed {
@@ -412,6 +414,7 @@ func (o *Observer) registerClose(path string, ts time.Time) {
 			Target:     path,
 			// No OutputHash: a newer close for this path arrived before
 			// this one was ever judged settled.
+			PathIsAmbiguous: superseded.ambiguous,
 		}
 	}
 }
@@ -465,6 +468,7 @@ func (o *Observer) resolveSettled(before map[string]*pendingClose, buf []byte, f
 			// a write landing before this point would instead have gone
 			// through registerClose's supersession above, or held this
 			// close back via the quiet check.
+			PathIsAmbiguous: entry.ambiguous,
 		}
 		if ok {
 			event.OutputHash = &digest

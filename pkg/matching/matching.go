@@ -30,15 +30,26 @@ func isFileAction(actionType models.ActionType) bool {
 
 // targetsMatch reports whether a trajectory target and a ground-truth target
 // refer to the same resource, applying per-action-type normalization.
-func targetsMatch(actionType models.ActionType, tTarget, gTarget string) bool {
+// gPathIsAmbiguous mirrors the ground-truth event's PathIsAmbiguous field
+// (see models.GroundTruthEvent) and gates the directory-covers-file fallback
+// below.
+func targetsMatch(actionType models.ActionType, tTarget, gTarget string, gPathIsAmbiguous bool) bool {
 	switch {
 	case isFileAction(actionType):
 		normT := filepath.Clean(tTarget)
 		normG := filepath.Clean(gTarget)
-		// A directory-level ground-truth event (fanotify reports the parent
-		// directory for some operations) corroborates a file operation that
-		// happened inside it.
-		return normT == normG || normG == filepath.Dir(normT)
+		if normT == normG {
+			return true
+		}
+		// A directory-level ground-truth event (fanotify merged events and
+		// dropped the filename, leaving only a DFID record) corroborates a
+		// file operation that happened inside it. This leniency only
+		// applies when the ground truth is genuinely a coarse-resolution
+		// record; an exactly-resolved ground-truth path that merely happens
+		// to equal a directory must match exactly, or a single ground-truth
+		// event could be stretched to corroborate any filename in that
+		// directory.
+		return gPathIsAmbiguous && normG == filepath.Dir(normT)
 	case actionType == models.ProcessExec || actionType == models.ProcessExit:
 		return commandsMatch(tTarget, gTarget)
 	default:
@@ -157,7 +168,7 @@ func Match(t models.TrajectoryEntry, g models.GroundTruthEvent, cfg Config) bool
 		return false
 	}
 
-	if !targetsMatch(t.ActionType, t.Target, g.Target) {
+	if !targetsMatch(t.ActionType, t.Target, g.Target, g.PathIsAmbiguous) {
 		return false
 	}
 

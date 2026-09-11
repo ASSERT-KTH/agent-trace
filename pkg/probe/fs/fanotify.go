@@ -58,6 +58,9 @@ type rawEvent struct {
 	Mask uint64
 	PID  int32
 	Path string
+	// Ambiguous is true when Path could only be resolved to its containing
+	// directory, not the specific file within it (see resolveEventPath).
+	Ambiguous bool
 }
 
 // --- Kernel interaction (requires CAP_SYS_ADMIN) --------------------------
@@ -144,12 +147,13 @@ func parseEvents(buf []byte, n int, resolve handleResolver) []rawEvent {
 		// Info records follow the metadata header.
 		infoStart := offset + int(meta.MetadataLen)
 		infoEnd := offset + int(meta.EventLen)
-		path := resolveEventPath(buf[infoStart:infoEnd], resolve)
+		path, ambiguous := resolveEventPath(buf[infoStart:infoEnd], resolve)
 
 		events = append(events, rawEvent{
-			Mask: meta.Mask,
-			PID:  meta.PID,
-			Path: path,
+			Mask:      meta.Mask,
+			PID:       meta.PID,
+			Path:      path,
+			Ambiguous: ambiguous,
 		})
 
 		offset += int(meta.EventLen)
@@ -174,7 +178,15 @@ func readMetadata(buf []byte) eventMetadata {
 //  1. DFID_NAME (type 2): parent directory handle + entry name (full path)
 //  2. FID (type 1): file handle resolved directly via open_by_handle_at
 //  3. DFID (type 3): parent directory handle only (no filename; merged events)
-func resolveEventPath(infoData []byte, resolve handleResolver) string {
+//
+// The second return value, ambiguous, is true only when the DFID-only
+// fallback (case 3) is what actually produced the returned path -- i.e. the
+// kernel merged events and dropped the filename, leaving only a directory
+// handle. It is false whenever DFID_NAME or FID resolved a specific,
+// non-degraded path. Callers use this to restrict the "directory covers any
+// file inside it" matching leniency to genuinely coarse-resolution events,
+// not to every ground-truth event whose target happens to be a directory.
+func resolveEventPath(infoData []byte, resolve handleResolver) (path string, ambiguous bool) {
 	var fidPath, dfidNamePath, dfidPath string
 
 	offset := 0
@@ -199,12 +211,12 @@ func resolveEventPath(infoData []byte, resolve handleResolver) string {
 	}
 
 	if dfidNamePath != "" {
-		return dfidNamePath
+		return dfidNamePath, false
 	}
 	if fidPath != "" {
-		return fidPath
+		return fidPath, false
 	}
-	return dfidPath
+	return dfidPath, true
 }
 
 // parseDfidName extracts a directory file handle and entry name from a

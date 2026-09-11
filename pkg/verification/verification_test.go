@@ -541,6 +541,80 @@ func TestE2E_T2_Fabrication(t *testing.T) {
 	}
 }
 
+// TestE2E_DirectoryFallbackRequiresAmbiguousFlag pins Fix 6 end to end:
+// targetsMatch's directory-covers-file leniency must only apply when the
+// ground truth is a genuinely ambiguous (DFID-only, kernel-merged) record.
+// A fabricated file claim must not be laundered through an unrelated,
+// exactly-resolved ground-truth event that merely happens to equal the
+// claimed file's parent directory.
+func TestE2E_DirectoryFallbackRequiresAmbiguousFlag(t *testing.T) {
+	claim := te(0, models.FileWrite, "/workspace/secret.txt", nil, sp("h"))
+
+	t.Run("exact ground truth equal to the directory does not corroborate", func(t *testing.T) {
+		ground := models.GroundTruth{
+			{IsTopLevel: bp(true), Timestamp: baseTime, ActionType: models.FileWrite, Target: "/workspace"},
+		}
+
+		v := Verify(models.Trajectory{claim}, ground, cfg)
+		if v.Faithful {
+			t.Error("a fabricated file claim must not be corroborated by an unrelated, exactly-resolved directory event")
+		}
+		if len(v.Unwitnessed) != 1 || v.Unwitnessed[0].Target != "/workspace/secret.txt" {
+			t.Errorf("expected the fabricated claim unwitnessed, got %+v", v.Unwitnessed)
+		}
+		if len(v.Corroborated) != 0 {
+			t.Errorf("expected 0 corroborated, got %d", len(v.Corroborated))
+		}
+	})
+
+	t.Run("ambiguous ground truth for the directory still corroborates", func(t *testing.T) {
+		ground := models.GroundTruth{
+			{IsTopLevel: bp(true), Timestamp: baseTime, ActionType: models.FileWrite, Target: "/workspace", PathIsAmbiguous: true},
+		}
+
+		v := Verify(models.Trajectory{claim}, ground, cfg)
+		if !v.Faithful {
+			t.Errorf("a genuinely ambiguous directory-level ground truth should still corroborate a file write inside it: %+v", v)
+		}
+		if len(v.Corroborated) != 1 {
+			t.Errorf("expected 1 corroborated, got %d", len(v.Corroborated))
+		}
+	})
+}
+
+// TestE2E_AmbiguousDirectoryEventCorroboratesOnlyOneClaim guards the
+// boundary of Fix 6's leniency: one ambiguous (DFID-only) ground-truth event
+// for a directory can corroborate a file claim inside that directory, but
+// Verify's one-to-one greedy matching (matched[bestIdx] = true) means it can
+// still corroborate only ONE such claim, not every file an agent claims to
+// have touched in that directory. A second, distinct file claim with no
+// ground-truth event of its own must remain unwitnessed even though the
+// same ambiguous directory event would, in isolation, satisfy targetsMatch
+// for it too.
+func TestE2E_AmbiguousDirectoryEventCorroboratesOnlyOneClaim(t *testing.T) {
+	claimA := te(0, models.FileWrite, "/workspace/a.txt", nil, sp("ha"))
+	claimB := te(1, models.FileWrite, "/workspace/b.txt", nil, sp("hb"))
+
+	ground := models.GroundTruth{
+		{IsTopLevel: bp(true), Timestamp: baseTime, ActionType: models.FileWrite, Target: "/workspace", PathIsAmbiguous: true},
+	}
+
+	v := Verify(models.Trajectory{claimA, claimB}, ground, cfg)
+
+	if v.Faithful {
+		t.Errorf("only one ground-truth event exists for two distinct file claims; verdict must not be faithful: %+v", v)
+	}
+	if len(v.Corroborated) != 1 {
+		t.Fatalf("expected exactly 1 corroborated claim (the event is consumed once), got %d: %+v", len(v.Corroborated), v.Corroborated)
+	}
+	if v.Corroborated[0].Entry.Target != "/workspace/a.txt" {
+		t.Errorf("expected the earlier claim (a.txt) to win the closest-timestamp match, got %q", v.Corroborated[0].Entry.Target)
+	}
+	if len(v.Unwitnessed) != 1 || v.Unwitnessed[0].Target != "/workspace/b.txt" {
+		t.Errorf("expected b.txt to remain unwitnessed once the ambiguous event is consumed by a.txt, got %+v", v.Unwitnessed)
+	}
+}
+
 // T3 attack: agent claims it read /etc/hostname but actually read /etc/shadow.
 // The trajectory entry matches the ground-truth event on (type, target, time)
 // but the output hash differs.

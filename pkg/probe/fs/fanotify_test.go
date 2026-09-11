@@ -107,6 +107,9 @@ func TestParseEvents_DfidName(t *testing.T) {
 	if events[0].Path != "/mock/dir/test.txt" {
 		t.Errorf("expected path /mock/dir/test.txt, got %q", events[0].Path)
 	}
+	if events[0].Ambiguous {
+		t.Error("DFID_NAME resolution should not be ambiguous")
+	}
 }
 
 func TestParseEvents_Fid(t *testing.T) {
@@ -125,6 +128,9 @@ func TestParseEvents_Fid(t *testing.T) {
 	if events[0].Path != "/mock/file.txt" {
 		t.Errorf("expected path /mock/file.txt, got %q", events[0].Path)
 	}
+	if events[0].Ambiguous {
+		t.Error("FID resolution should not be ambiguous")
+	}
 }
 
 func TestParseEvents_DfidOnly(t *testing.T) {
@@ -142,6 +148,9 @@ func TestParseEvents_DfidOnly(t *testing.T) {
 
 	if events[0].Path != "/mock/dir" {
 		t.Errorf("expected path /mock/dir, got %q", events[0].Path)
+	}
+	if !events[0].Ambiguous {
+		t.Error("DFID-only resolution (no filename) should be ambiguous")
 	}
 }
 

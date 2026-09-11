@@ -72,17 +72,35 @@ func assertHasEvent(t *testing.T, events []models.GroundTruthEvent, action model
 // On some filesystems (tmpfs), directory events (DELETE, RENAME) resolve
 // only to the parent directory because DFID_NAME info records lack the
 // filename. On ext4/xfs this resolves to the full path.
+//
+// It also pins Fix 6 against a real kernel, not a mock: resolveEventPath
+// guarantees PathIsAmbiguous is true exactly when the DFID-only fallback (no
+// filename) produced the target, and false whenever DFID_NAME or FID
+// resolved the full path. Whichever branch this filesystem actually took,
+// the flag must agree with it.
 func assertHasEventInDir(t *testing.T, events []models.GroundTruthEvent, action models.ActionType, target string) {
 	t.Helper()
 	dir := filepath.Dir(target)
 	for _, e := range events {
-		if e.ActionType == action && (e.Target == target || e.Target == dir) {
+		if e.ActionType != action {
+			continue
+		}
+		switch e.Target {
+		case target:
+			if e.PathIsAmbiguous {
+				t.Errorf("%s on %s resolved to the full path but PathIsAmbiguous was true", action, target)
+			}
+			return
+		case dir:
+			if !e.PathIsAmbiguous {
+				t.Errorf("%s on %s resolved only to parent dir %s but PathIsAmbiguous was false", action, target, dir)
+			}
 			return
 		}
 	}
 	t.Errorf("expected event %s on %s (or dir %s), got %d events:", action, target, dir, len(events))
 	for _, e := range events {
-		t.Logf("  %s %s", e.ActionType, e.Target)
+		t.Logf("  %s %s (ambiguous=%v)", e.ActionType, e.Target, e.PathIsAmbiguous)
 	}
 }
 
@@ -443,6 +461,71 @@ func TestObserver_SupersededCloseNeverHashed(t *testing.T) {
 	}
 }
 
+// TestObserver_SupersededCloseAmbiguityFlag pins Fix 6's other half: when a
+// close is superseded before it ever settles, the emitted (unhashed) event
+// must carry the SUPERSEDED close's own PathIsAmbiguous value, not the
+// superseding one's. registerClose reads it off the old pendingClose entry
+// before overwriting the map, so a change in ambiguity between the two
+// closes must not leak across the supersession in either direction.
+func TestObserver_SupersededCloseAmbiguityFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		firstAmbiguous  bool
+		secondAmbiguous bool
+	}{
+		{name: "exact superseded by ambiguous", firstAmbiguous: false, secondAmbiguous: true},
+		{name: "ambiguous superseded by exact", firstAmbiguous: true, secondAmbiguous: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			target := filepath.Join(dir, "superseded.txt")
+
+			obs := newHashSeamObserver(t, dir, func(string) (string, error) {
+				return "sha256:final", nil
+			})
+
+			obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target, Ambiguous: tc.firstAmbiguous}, time.Now())
+			obs.processRawEvent(&rawEvent{Mask: unix.FAN_CLOSE_WRITE, PID: int32(os.Getpid()), Path: target, Ambiguous: tc.secondAmbiguous}, time.Now())
+
+			var got *models.GroundTruthEvent
+			for _, e := range drainEvents(obs) {
+				if e.ActionType == models.FileClose {
+					ev := e
+					got = &ev
+				}
+			}
+			if got == nil {
+				t.Fatal("expected a superseded FileClose event")
+			}
+			if got.OutputHash != nil {
+				t.Errorf("superseded close should have no OutputHash, got %q", *got.OutputHash)
+			}
+			if got.PathIsAmbiguous != tc.firstAmbiguous {
+				t.Errorf("superseded event PathIsAmbiguous = %v, want %v (the superseded close's own value, not the superseding one's)", got.PathIsAmbiguous, tc.firstAmbiguous)
+			}
+
+			// The surviving (second) close settles normally and must carry
+			// its own ambiguous value, not the superseded one's.
+			before := obs.settleSnapshot()
+			obs.resolveSettled(before, hashSeamBuf(), false)
+
+			got = nil
+			for _, e := range drainEvents(obs) {
+				if e.ActionType == models.FileClose {
+					ev := e
+					got = &ev
+				}
+			}
+			if got == nil {
+				t.Fatal("expected the surviving close to settle")
+			}
+			if got.PathIsAmbiguous != tc.secondAmbiguous {
+				t.Errorf("settled event PathIsAmbiguous = %v, want %v (the surviving close's own value)", got.PathIsAmbiguous, tc.secondAmbiguous)
+			}
+		})
+	}
+}
+
 // TestObserver_CloseHeldUntilPathQuiet pins Fix 5 round 4: a FileClose is not
 // hashed until its path has gone settleDelay with no further write-class
 // event. Surviving one settle cycle is not sufficient -- an intermediate
@@ -692,8 +775,8 @@ func TestDiag_RawFanotify(t *testing.T) {
 		}
 
 		// Try path resolution.
-		path := resolveEventPath(infoData, newKernelResolver(mountFD))
-		t.Logf("  resolved path: %q", path)
+		path, ambiguous := resolveEventPath(infoData, newKernelResolver(mountFD))
+		t.Logf("  resolved path: %q (ambiguous=%v)", path, ambiguous)
 
 		// Detailed handle resolution debugging for each info record.
 		ioff := 0
