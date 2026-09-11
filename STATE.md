@@ -42,6 +42,8 @@ CI fix was committed and pushed as `c3fb88e`. The project baseline stays Go 1.25
 * golangci-lint is not in PATH; `~/go/bin/golangci-lint` is a stale v1.59.1 broken on this toolchain. Install v2.13.2 into a scratchpad via `GOBIN=<scratchpad> go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2` (it self-upgrades the toolchain to go1.26.8 via GOTOOLCHAIN on install, that's expected).
 
 **Completed Steps:**
+* F4.1 TOCTOU Race Condition Eliminated: Restored the timer-based 20ms settle window in `fs.Observer` but upgraded it to capture a synchronous `O_PATH` file descriptor on `FAN_CLOSE_WRITE`. This gives perfect TOCTOU immunity against file deletion/rename because the inode is kept alive, while properly dropping intermediate hashes during rapid overwrites.
+* F4.2 InputHash for File Reads: Implemented Stateful Shadowing. The fs probe walks the workspace at startup to pre-cache hashes, updates them on every settled `FAN_CLOSE_WRITE`, and safely attaches `InputHash` to `FAN_OPEN` events before any truncation can destroy the evidence.
 * F2.2 Command Normalization Removed [Committed & Merged]
 * F4.1 TOCTOU Hotfix [Committed & Merged]
 * F2.1 eBPF Refactor (Ring Buffer & CO-RE): Replaced the 12-slot `argv` fixed array with a dynamic `bpf_ringbuf` payload in `proc.bpf.c`. `argv` is now parsed sequentially up to 64 arguments or 8KB limit, packed as contiguous NUL-terminated strings. Changed `pkg/probe/proc/observer.go` to safely decode the new dynamic `bpfEventHdr` structure followed by the byte slices.
@@ -52,7 +54,4 @@ CI fix was committed and pushed as `c3fb88e`. The project baseline stays Go 1.25
 * The process probe `pkg/probe/proc/...` has been successfully refactored and compiles correctly. Unprivileged tests pass.
 
 **Next Steps:**
-1. Wait for the user to run `sudo go test -v ./...` to validate that the new BPF CO-RE and Ring Buffer architecture successfully captures variable-length arguments.
-2. Commit the `fix/ebpf-ringbuf` branch.
-3. Review `docs/plan/04_implementation_decisions.md` (or write it if it doesn't exist) to document low-level choices and why they were chosen to cover specific threat models, per user request.
-4. Begin Tier 4.2: Implement `InputHash` for `FileOpen`/`FileRead`.
+1. Verify Tier 4.2 privileged E2E tests, then proceed to Tier 3 or Tier 5.

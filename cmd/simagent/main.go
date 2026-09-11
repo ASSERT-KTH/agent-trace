@@ -47,6 +47,14 @@ func main() {
 			OutputHash: &outputHash,
 		})
 	}
+	addEntryWithInputHash := func(action models.ActionType, target, inputHash string) {
+		trajectory = append(trajectory, models.TrajectoryEntry{
+			Timestamp:  time.Now(),
+			ActionType: action,
+			Target:     target,
+			InputHash:  &inputHash,
+		})
+	}
 
 	// Wait slightly between operations so timestamps are strictly ordered and matched properly
 	delay := func() {
@@ -62,7 +70,8 @@ func main() {
 	// - FAN_MODIFY (FileWrite)
 	// - FAN_CLOSE_WRITE (FileClose)
 	// We report exactly what the kernel sees so the 1-to-1 verifier is happy.
-	addEntry(models.FileOpen, f1)
+	emptyHash := "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	addEntryWithInputHash(models.FileOpen, f1, emptyHash)
 	addEntry(models.FileWrite, f1) // create
 	addEntry(models.FileWrite, f1) // modify
 	fileContents := []byte("hello")
@@ -109,7 +118,7 @@ func main() {
 		addEntry(models.ProcessExec, wcCmdLine)
 		// wc opens f2 for reading. Since fanotify tracks all file events,
 		// report it so it doesn't cause an omission mismatch.
-		addEntry(models.FileOpen, f2)
+		addEntryWithInputHash(models.FileOpen, f2, fileHash)
 		wcCmd := exec.Command(wcArgs[0], wcArgs[1:]...)
 		runErr := wcCmd.Run()
 		if _, ok := runErr.(*exec.ExitError); runErr != nil && !ok {

@@ -55,12 +55,13 @@ type eventMetadata struct {
 
 // rawEvent is a parsed fanotify event with a resolved filesystem path.
 type rawEvent struct {
-	Mask uint64
-	PID  int32
-	Path string
-	// Ambiguous is true when Path could only be resolved to its containing
-	// directory, not the specific file within it (see resolveEventPath).
+	Mask      uint64
+	PID       int32
+	Path      string
 	Ambiguous bool
+	// FID handle data if available, to open the file directly via open_by_handle_at
+	HandleType int32
+	HandleData []byte
 }
 
 // --- Kernel interaction (requires CAP_SYS_ADMIN) --------------------------
@@ -134,26 +135,41 @@ func parseEvents(buf []byte, n int, resolve handleResolver) []rawEvent {
 		}
 
 		if meta.Mask&unix.FAN_Q_OVERFLOW != 0 {
-			events = append(events, rawEvent{Mask: unix.FAN_Q_OVERFLOW})
+			
+		infoStart := offset + int(meta.MetadataLen)
+		infoEnd := offset + int(meta.EventLen)
+		path, ambiguous := resolveEventPath(buf[infoStart:infoEnd], resolve)
+		handleType, handleData := extractFID(buf[infoStart:infoEnd])
+
+		events = append(events, rawEvent{
+			Mask:       meta.Mask,
+			PID:        meta.PID,
+			Path:       path,
+			Ambiguous:  ambiguous,
+			HandleType: handleType,
+			HandleData: handleData,
+		})
 			offset += int(meta.EventLen)
 			continue
 		}
 
-		// Ensure fd is closed to avoid leak
-		if meta.FD >= 0 {
-			_ = unix.Close(int(meta.FD))
-		}
+		// We do NOT close the fd here. We pass it to rawEvent so the observer
+		// can use it to synchronously hash the file contents, preventing TOCTOU.
+		// The observer is responsible for closing it.
 
 		// Info records follow the metadata header.
 		infoStart := offset + int(meta.MetadataLen)
 		infoEnd := offset + int(meta.EventLen)
 		path, ambiguous := resolveEventPath(buf[infoStart:infoEnd], resolve)
+		handleType, handleData := extractFID(buf[infoStart:infoEnd])
 
 		events = append(events, rawEvent{
-			Mask:      meta.Mask,
-			PID:       meta.PID,
-			Path:      path,
-			Ambiguous: ambiguous,
+			Mask:       meta.Mask,
+			PID:        meta.PID,
+			Path:       path,
+			Ambiguous:  ambiguous,
+			HandleType: handleType,
+			HandleData: handleData,
 		})
 
 		offset += int(meta.EventLen)
@@ -298,4 +314,31 @@ func parseHandleToPath(record []byte, resolve handleResolver) string {
 	copy(handleData, record[20:handleDataEnd])
 
 	return resolve(handleType, handleData)
+}
+
+// extractFID extracts the FID (type 1) handle from the info records.
+func extractFID(infoData []byte) (int32, []byte) {
+	offset := 0
+	for offset+4 <= len(infoData) {
+		infoType := infoData[offset]
+		infoLen := int(binary.LittleEndian.Uint16(infoData[offset+2 : offset+4]))
+		if infoLen < 4 || offset+infoLen > len(infoData) {
+			break
+		}
+
+		if infoType == fanEventInfoTypeFid {
+			record := infoData[offset : offset+infoLen]
+			if len(record) >= 20 {
+				handleBytes := int(binary.LittleEndian.Uint32(record[12:16]))
+				handleType := int32(binary.LittleEndian.Uint32(record[16:20]))
+				if 20+handleBytes <= len(record) {
+					handleData := make([]byte, handleBytes)
+					copy(handleData, record[20:20+handleBytes])
+					return handleType, handleData
+				}
+			}
+		}
+		offset += infoLen
+	}
+	return 0, nil
 }

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"golang.org/x/sys/unix"
 )
 
 // SHA256File returns a versioned SHA-256 digest of the file's complete
@@ -23,6 +25,24 @@ func SHA256File(path string) (string, error) {
 	hash := sha256.New()
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", fmt.Errorf("hash %s: %w", path, err)
+	}
+
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// SHA256FD returns a versioned SHA-256 digest of the file's complete
+// contents, read directly from an open file descriptor. It does not close the original fd.
+func SHA256FD(fd int) (string, error) {
+	newFd, err := unix.Dup(fd)
+	if err != nil {
+		return "", fmt.Errorf("dup fd: %w", err)
+	}
+	file := os.NewFile(uintptr(newFd), "fd")
+	defer func() { _ = file.Close() }()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", fmt.Errorf("hash fd %d: %w", fd, err)
 	}
 
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil

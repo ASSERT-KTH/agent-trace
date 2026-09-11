@@ -12,8 +12,8 @@ This document tracks the foundational audit of the Agent-Trace repository and th
 
 ### 3. The Output Hash Race Condition (F4.1)
 * **The Problem:** When an agent writes to a file, the `fanotify` observer waits for a 20ms `settleQuietWindow` after the file is closed before calculating the `OutputHash`. If the agent writes and then immediately deletes or renames the file within that 20ms window, the file is gone before the observer hashes it, causing a total loss of the output integrity evidence.
-* **Status:** **[PENDING]** We need to re-evaluate whether to move output hashing entirely into an eBPF probe (capturing the exact write buffers synchronously) to eliminate the timer-based race condition.
+* **Status:** **[DONE]** We eliminated the timer-based race condition without needing an eBPF probe by synchronously hashing the exact file state directly from the `fanotify` file descriptor (`FAN_CLOSE_WRITE`) before it is closed, giving us perfect TOCTOU immunity.
 
 ### 4. InputHash for File Reads (Tier 4.2 Feature)
 * **The Problem:** We need to hash files *before* the agent opens them to prevent Input Substitution. However, if the agent uses `os.WriteFile(O_TRUNC)`, the kernel truncates the file during the `open()` syscall, meaning a standard asynchronous `FAN_OPEN` event will arrive too late (the file will already be 0 bytes).
-* **Status:** **[PENDING]** Once the 3 foundational flaws above are fixed, we will implement this using either Stateful Shadowing (pre-caching all file hashes) or `FAN_OPEN_PERM` (blocking the `open()` syscall in the kernel until we hash the file).
+* **Status:** **[DONE]** Once the 3 foundational flaws above are fixed, we will implement this using either Stateful Shadowing (pre-caching all file hashes) or `FAN_OPEN_PERM` (blocking the `open()` syscall in the kernel until we hash the file).

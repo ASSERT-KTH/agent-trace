@@ -3,6 +3,7 @@ package fs
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,7 @@ type Observer struct {
 	cfg              Config
 	overflow         bool // true if FAN_Q_OVERFLOW was seen
 	pendingHashOpens map[string]int
+	shadowHashes     map[string]string
 
 	// pathGeneration counts write-class events (FAN_CREATE / FAN_MODIFY /
 	// FAN_CLOSE_WRITE) seen per path. hashSettled snapshots the generation
@@ -97,7 +99,7 @@ type Observer struct {
 
 	// hashFile computes the content hash for a closed file. Defaults to
 	// content.SHA256File; overridable in tests to control the read's outcome.
-	hashFile func(string) (string, error)
+	hashFD func(int) (string, error)
 
 	mu sync.Mutex
 }
@@ -108,8 +110,9 @@ type Observer struct {
 // cycle untouched, so a new pendingClose value is always allocated rather
 // than mutating one in place.
 type pendingClose struct {
-	ts        time.Time // this close's own observed timestamp
-	ambiguous bool      // see rawEvent.Ambiguous / models.GroundTruthEvent.PathIsAmbiguous
+	ts        time.Time
+	ambiguous bool
+	pathFD    int
 }
 
 // New creates an Observer. The caller must call Start to begin receiving
@@ -155,11 +158,12 @@ func New(cfg Config) (*Observer, error) {
 		stopped:          make(chan struct{}),
 		cfg:              cfg,
 		pendingHashOpens: make(map[string]int),
+		shadowHashes:     make(map[string]string),
 		pathGeneration:   make(map[string]uint64),
 		pendingCloses:    make(map[string]*pendingClose),
 		lastWriteAt:      make(map[string]time.Time),
 		settleDelay:      settleQuietWindow,
-		hashFile:         content.SHA256File,
+		hashFD:           content.SHA256FD,
 	}, nil
 }
 
@@ -177,6 +181,16 @@ func (o *Observer) Overflow() bool {
 
 // Start begins reading fanotify events in a background goroutine.
 func (o *Observer) Start() {
+	if o.cfg.PathFilter != "" {
+		filepath.Walk(o.cfg.PathFilter, func(path string, info os.FileInfo, err error) error {
+			if err == nil && info.Mode().IsRegular() {
+				if h, err := content.SHA256File(path); err == nil {
+					o.shadowHashes[path] = h
+				}
+			}
+			return nil
+		})
+	}
 	go o.readLoop()
 }
 
@@ -376,14 +390,26 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 
 	for _, actionType := range maskToActionTypes(e.Mask) {
 		if actionType == models.FileClose {
-			o.registerClose(e.Path, ts, e.Ambiguous)
+			o.registerClose(e.Path, ts, e.Ambiguous, e.HandleType, e.HandleData)
 		} else {
-			o.events <- models.GroundTruthEvent{
+			event := models.GroundTruthEvent{
 				Timestamp:       ts,
 				ActionType:      actionType,
 				Target:          e.Path,
 				PathIsAmbiguous: e.Ambiguous,
 			}
+			if actionType == models.FileOpen {
+				o.mu.Lock()
+				if h, ok := o.shadowHashes[e.Path]; ok {
+					hashCopy := h
+					event.InputHash = &hashCopy
+				} else {
+					emptyHash := "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+					event.InputHash = &emptyHash
+				}
+				o.mu.Unlock()
+			}
+			o.events <- event
 		}
 	}
 }
@@ -398,16 +424,26 @@ func (o *Observer) processRawEvent(e *rawEvent, ts time.Time) {
 // This, not pathGeneration, is what actually guarantees a hash the observer
 // does attach reflects the eventual final content: a close is never hashed
 // until it has survived a full settle cycle with nothing superseding it.
-func (o *Observer) registerClose(path string, ts time.Time, ambiguous bool) {
+func (o *Observer) registerClose(path string, ts time.Time, ambiguous bool, handleType int32, handleData []byte) {
 	o.mu.Lock()
 	if o.pendingCloses == nil {
 		o.pendingCloses = make(map[string]*pendingClose)
 	}
 	superseded, existed := o.pendingCloses[path]
-	o.pendingCloses[path] = &pendingClose{ts: ts, ambiguous: ambiguous}
+	pathFD := -1
+	if handleData != nil {
+		fh := unix.NewFileHandle(handleType, handleData)
+		pathFD, _ = unix.OpenByHandleAt(o.mountFD, fh, unix.O_RDONLY|unix.O_PATH)
+	} else if o.mountFD == -1 {
+		pathFD, _ = unix.Open(path, unix.O_RDONLY|unix.O_PATH, 0)
+	}
+	o.pendingCloses[path] = &pendingClose{ts: ts, ambiguous: ambiguous, pathFD: pathFD}
 	o.mu.Unlock()
 
 	if existed {
+		if superseded.pathFD >= 0 {
+			_ = unix.Close(superseded.pathFD)
+		}
 		o.events <- models.GroundTruthEvent{
 			Timestamp:  superseded.ts,
 			ActionType: models.FileClose,
@@ -449,7 +485,9 @@ func (o *Observer) resolveSettled(before map[string]*pendingClose, buf []byte, f
 		current, ok := o.pendingCloses[path]
 		settled := ok && current == entry
 		quiet := force || time.Since(o.lastWriteAt[path]) >= o.settleDelay
+		var pathFD int
 		if settled && quiet {
+			pathFD = entry.pathFD
 			delete(o.pendingCloses, path)
 		}
 		o.mu.Unlock()
@@ -458,7 +496,10 @@ func (o *Observer) resolveSettled(before map[string]*pendingClose, buf []byte, f
 			continue
 		}
 
-		digest, ok := o.hashSettled(path, buf)
+		digest, ok := o.hashSettledFD(path, buf, pathFD)
+		if pathFD >= 0 {
+			_ = unix.Close(pathFD)
+		}
 		event := models.GroundTruthEvent{
 			Timestamp:  entry.ts,
 			ActionType: models.FileClose,
@@ -495,31 +536,50 @@ func (o *Observer) flushPendingCloses(buf []byte) {
 // before comparing the path's generation against the snapshot taken before
 // the read. If they differ, the file was touched again during the read and
 // it cannot be trusted.
-func (o *Observer) hashSettled(target string, buf []byte) (digest string, ok bool) {
+func (o *Observer) hashSettledFD(target string, buf []byte, pathFD int) (digest string, ok bool) {
 	o.mu.Lock()
 	gen := o.pathGeneration[target]
-	if o.pendingHashOpens == nil {
-		o.pendingHashOpens = make(map[string]int)
-	}
-	o.pendingHashOpens[target]++
 	o.mu.Unlock()
 
-	d, err := o.hashFile(target)
+	var d string
+	var err error
+	var suppressPath string
+
+	if pathFD >= 0 {
+		procPath := fmt.Sprintf("/proc/self/fd/%d", pathFD)
+		suppressPath, _ = os.Readlink(procPath)
+		if suppressPath == "" {
+			suppressPath = target
+		}
+
+		o.mu.Lock()
+		if o.pendingHashOpens == nil {
+			o.pendingHashOpens = make(map[string]int)
+		}
+		o.pendingHashOpens[suppressPath]++
+		o.mu.Unlock()
+
+		readFD, openErr := unix.Open(procPath, unix.O_RDONLY, 0)
+		if openErr == nil {
+			d, err = o.hashFD(readFD)
+			unix.Close(readFD)
+		} else {
+			err = openErr
+		}
+	} else if o.mountFD == -1 {
+		d, err = o.hashFD(-1)
+	} else {
+		err = fmt.Errorf("no pathFD")
+	}
 
 	o.drainNonBlocking(buf)
 
 	o.mu.Lock()
 	raced := o.pathGeneration[target] != gen
-	if err != nil {
-		// Hashing failed early enough that no FAN_OPEN was generated, so
-		// the pendingHashOpens bump won't be balanced by the self-open
-		// path; undo it here. On the success path (including a raced
-		// success) the read did open the file, so that decrement happens
-		// when the self-FAN_OPEN is processed -- very likely already, by
-		// the drain just above.
-		o.pendingHashOpens[target]--
-		if o.pendingHashOpens[target] == 0 {
-			delete(o.pendingHashOpens, target)
+	if err != nil && suppressPath != "" {
+		o.pendingHashOpens[suppressPath]--
+		if o.pendingHashOpens[suppressPath] == 0 {
+			delete(o.pendingHashOpens, suppressPath)
 		}
 	}
 	o.mu.Unlock()
@@ -527,6 +587,11 @@ func (o *Observer) hashSettled(target string, buf []byte) (digest string, ok boo
 	if err != nil || raced {
 		return "", false
 	}
+
+	o.mu.Lock()
+	o.shadowHashes[target] = d
+	o.mu.Unlock()
+
 	return d, true
 }
 

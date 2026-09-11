@@ -2,7 +2,7 @@
   "yolo-except-commit": {
     "PreToolUse": [
       {
-        "matcher": "*",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",

@@ -251,7 +251,7 @@ func TestObserverIgnoresHashReadOpen(t *testing.T) {
 // seam, so those get real, inert pipe fds -- never written to, so poll on
 // them always reports "nothing ready" -- rather than the zero value (fd 0,
 // i.e. stdin, whose poll behavior isn't something a test should depend on).
-func newHashSeamObserver(t *testing.T, dir string, hashFile func(string) (string, error)) *Observer {
+func newHashSeamObserver(t *testing.T, dir string, hashFD func(int) (string, error)) *Observer {
 	t.Helper()
 	var pipeFDs [2]int
 	if err := unix.Pipe2(pipeFDs[:], unix.O_CLOEXEC); err != nil {
@@ -263,13 +263,15 @@ func newHashSeamObserver(t *testing.T, dir string, hashFile func(string) (string
 	})
 	return &Observer{
 		fanotifyFD:       pipeFDs[0],
+		mountFD:          -1,
 		stopR:            pipeFDs[0],
 		events:           make(chan models.GroundTruthEvent, 16),
 		cfg:              Config{PathFilter: dir},
 		pendingHashOpens: map[string]int{},
 		pathGeneration:   map[string]uint64{},
+		shadowHashes:     map[string]string{},
 		lastWriteAt:      map[string]time.Time{},
-		hashFile:         hashFile,
+		hashFD:         hashFD,
 		// settleDelay left zero: these tests drive settleSnapshot/
 		// resolveSettled directly and want an immediate resolve.
 	}
@@ -305,7 +307,7 @@ func TestObserver_RacedCloseDropsHash(t *testing.T) {
 	target := filepath.Join(dir, "raced.txt")
 
 	var obs *Observer
-	obs = newHashSeamObserver(t, dir, func(string) (string, error) {
+	obs = newHashSeamObserver(t, dir, func(int) (string, error) {
 		obs.processRawEvent(&rawEvent{Mask: unix.FAN_MODIFY, PID: int32(os.Getpid()), Path: target}, time.Now())
 		return "sha256:stalehash", nil
 	})
@@ -338,7 +340,7 @@ func TestObserver_UnracedCloseKeepsHash(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "clean.txt")
 
-	obs := newHashSeamObserver(t, dir, func(string) (string, error) {
+	obs := newHashSeamObserver(t, dir, func(int) (string, error) {
 		return "sha256:goodhash", nil
 	})
 
@@ -371,7 +373,7 @@ func TestObserver_BatchedCloseTrustsPostBatchGeneration(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "batched.txt")
 
-	obs := newHashSeamObserver(t, dir, func(string) (string, error) {
+	obs := newHashSeamObserver(t, dir, func(int) (string, error) {
 		return "sha256:final", nil
 	})
 
@@ -412,7 +414,7 @@ func TestObserver_SupersededCloseNeverHashed(t *testing.T) {
 	target := filepath.Join(dir, "superseded.txt")
 
 	var hashCalls int
-	obs := newHashSeamObserver(t, dir, func(string) (string, error) {
+	obs := newHashSeamObserver(t, dir, func(int) (string, error) {
 		hashCalls++
 		return "sha256:final", nil
 	})
@@ -480,7 +482,7 @@ func TestObserver_SupersededCloseAmbiguityFlag(t *testing.T) {
 			dir := t.TempDir()
 			target := filepath.Join(dir, "superseded.txt")
 
-			obs := newHashSeamObserver(t, dir, func(string) (string, error) {
+			obs := newHashSeamObserver(t, dir, func(int) (string, error) {
 				return "sha256:final", nil
 			})
 
@@ -539,7 +541,7 @@ func TestObserver_CloseHeldUntilPathQuiet(t *testing.T) {
 	target := filepath.Join(dir, "burst.txt")
 
 	var hashCalls int
-	obs := newHashSeamObserver(t, dir, func(string) (string, error) {
+	obs := newHashSeamObserver(t, dir, func(int) (string, error) {
 		hashCalls++
 		return "sha256:final", nil
 	})
