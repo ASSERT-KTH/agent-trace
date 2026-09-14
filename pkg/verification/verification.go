@@ -58,6 +58,20 @@ func exitCodesAgree(a, b *int32) bool {
 	return *a == *b
 }
 
+// requestHashesAgree compares two optional NetRequest request-body hashes
+// with the same nil-agreement rule as hashesAgree and exitCodesAgree: if
+// either side didn't report one (no body, or the capture layer couldn't
+// attribute content to the connection), we cannot disprove the claim. A
+// mismatch requires both sides to report a hash and for those hashes to
+// differ -- e.g. the agent claims a request body that the observed
+// plaintext does not match.
+func requestHashesAgree(a, b *string) bool {
+	if a == nil || b == nil {
+		return true
+	}
+	return *a == *b
+}
+
 // Verify compares a self-reported trajectory T against an independently
 // observed ground truth G and classifies every entry/event into one of
 // four sets: Corroborated, Unwitnessed, Unrecorded, or Mismatched.
@@ -101,6 +115,7 @@ func Verify(t models.Trajectory, g models.GroundTruth, cfg matching.Config) Verd
 		inputOK := hashesAgree(entry.InputHash, g[bestIdx].InputHash)
 		outputOK := hashesAgree(entry.OutputHash, g[bestIdx].OutputHash)
 		exitOK := exitCodesAgree(entry.ExitCode, g[bestIdx].ExitCode)
+		requestOK := requestHashesAgree(entry.RequestHash, g[bestIdx].RequestHash)
 
 		// The general nil-agreement rule above is correct when the ground
 		// truth side is nil (the probe couldn't capture it, benefit of the
@@ -120,7 +135,7 @@ func Verify(t models.Trajectory, g models.GroundTruth, cfg matching.Config) Verd
 			exitOK = false
 		}
 
-		if inputOK && outputOK && exitOK {
+		if inputOK && outputOK && exitOK && requestOK {
 			v.Corroborated = append(v.Corroborated, pair)
 		} else {
 			v.Mismatched = append(v.Mismatched, pair)

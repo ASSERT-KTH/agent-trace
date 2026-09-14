@@ -17,6 +17,9 @@ type TrajectoryEntry struct {
 	// not reported (e.g. the action isn't a process exit, or the reporter
 	// couldn't determine it).
 	ExitCode *int32 `json:"exit_code,omitempty"`
+	// RequestHash is "sha256:<hex>" of a NetRequest entry's request body.
+	// Nil when the request has no body, or the action isn't a NetRequest.
+	RequestHash *string `json:"request_hash,omitempty"`
 }
 
 // GroundTruthEvent is an independently observed action from the host-level probes.
@@ -43,6 +46,10 @@ type GroundTruthEvent struct {
 	// exact," which is both the common case and the safe default for any
 	// producer that doesn't set it.
 	PathIsAmbiguous bool `json:"path_is_ambiguous,omitempty"`
+	// RequestHash is "sha256:<hex>" of an observed NetRequest's request
+	// body, computed from the plaintext captured pre-encryption. Nil when
+	// the request had no body, or the action isn't a NetRequest.
+	RequestHash *string `json:"request_hash,omitempty"`
 }
 
 func (e *TrajectoryEntry) Validate() error {

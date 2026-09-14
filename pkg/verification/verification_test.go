@@ -260,6 +260,54 @@ func TestExitCodeNilTreatedAsAgreement(t *testing.T) {
 	}
 }
 
+func TestRequestHashMismatch(t *testing.T) {
+	claimed := "sha256:claimed"
+	real := "sha256:real"
+	traj := models.Trajectory{
+		{Timestamp: baseTime, ActionType: models.NetRequest,
+			Target: "GET https://api.example.com/v1/chat", RequestHash: &claimed},
+	}
+	ground := models.GroundTruth{
+		{IsTopLevel: bp(true), Timestamp: baseTime.Add(5 * time.Millisecond), ActionType: models.NetRequest,
+			Target: "GET https://api.example.com/v1/chat", RequestHash: &real},
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if v.Faithful {
+		t.Error("expected NOT FAITHFUL: claimed request body hash does not match observed plaintext")
+	}
+	if len(v.Mismatched) != 1 {
+		t.Fatalf("expected 1 mismatched, got %d", len(v.Mismatched))
+	}
+	if *v.Mismatched[0].Entry.RequestHash != claimed || *v.Mismatched[0].Event.RequestHash != real {
+		t.Errorf("wrong request hashes in mismatch: entry=%s event=%s",
+			*v.Mismatched[0].Entry.RequestHash, *v.Mismatched[0].Event.RequestHash)
+	}
+}
+
+func TestRequestHashNilTreatedAsAgreement(t *testing.T) {
+	traj := models.Trajectory{
+		{Timestamp: baseTime, ActionType: models.NetRequest, Target: "GET https://api.example.com/v1/chat"},
+	}
+	ground := models.GroundTruth{
+		// Capture layer couldn't attribute content to this connection
+		// (e.g. an unattributed ssl_frame, or an h2 connection): should
+		// not be a mismatch on its own.
+		{IsTopLevel: bp(true), Timestamp: baseTime.Add(5 * time.Millisecond), ActionType: models.NetRequest,
+			Target: "GET https://api.example.com/v1/chat"},
+	}
+
+	v := Verify(traj, ground, cfg)
+
+	if !v.Faithful {
+		t.Error("nil request hash on both sides should not cause mismatch")
+	}
+	if len(v.Corroborated) != 1 {
+		t.Errorf("expected 1 corroborated, got %d", len(v.Corroborated))
+	}
+}
+
 func ip(n int32) *int32 { return &n }
 
 // Fix 4: a FileClose entry that omits OutputHash while the ground truth
