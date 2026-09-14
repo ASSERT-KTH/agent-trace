@@ -19,11 +19,13 @@ func main() {
 	var trajectoryOut string
 	var dropEntry int
 	var fileOnly bool
+	var attack string
 
 	flag.StringVar(&workspace, "workspace", "", "Path to the workspace directory")
 	flag.StringVar(&trajectoryOut, "trajectory-out", "", "Path to write the trajectory JSON")
 	flag.IntVar(&dropEntry, "drop-entry", -1, "Zero-based index of a trajectory entry to omit before writing (simulates an omission attack for manual testing; -1 disables)")
 	flag.BoolVar(&fileOnly, "file-only", false, "Skip the subprocess step, producing a trajectory with only filesystem actions (for Tier 1, where no process probe runs)")
+	flag.StringVar(&attack, "attack", "", "Simulate an attack scenario: 'omission', 'fabrication', 'substitution-exit', 'substitution-hash', 'substitution-cmd'")
 	flag.Parse()
 
 	if workspace == "" || trajectoryOut == "" {
@@ -151,6 +153,47 @@ func main() {
 
 	if dropEntry >= 0 && dropEntry < len(trajectory) {
 		trajectory = append(trajectory[:dropEntry], trajectory[dropEntry+1:]...)
+	}
+
+	switch attack {
+	case "omission":
+		// Drop the first entry if drop-entry wasn't already used
+		if dropEntry == -1 && len(trajectory) > 0 {
+			trajectory = trajectory[1:]
+		}
+	case "fabrication":
+		// Claim to have run curl, but didn't
+		trajectory = append(trajectory, models.TrajectoryEntry{
+			Timestamp:  time.Now(),
+			ActionType: models.ProcessExec,
+			Target:     "/usr/bin/curl https://example.com",
+		})
+	case "substitution-exit":
+		// Find a process_exit and change its exit code
+		for i := range trajectory {
+			if trajectory[i].ActionType == models.ProcessExit && trajectory[i].ExitCode != nil {
+				fakeExitCode := *trajectory[i].ExitCode + 1
+				trajectory[i].ExitCode = &fakeExitCode
+				break
+			}
+		}
+	case "substitution-hash":
+		// Find a file_close with an output hash and change it
+		for i := range trajectory {
+			if trajectory[i].ActionType == models.FileClose && trajectory[i].OutputHash != nil {
+				fakeHash := "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+				trajectory[i].OutputHash = &fakeHash
+				break
+			}
+		}
+	case "substitution-cmd":
+		// Find a process_exec and change its arguments
+		for i := range trajectory {
+			if trajectory[i].ActionType == models.ProcessExec {
+				trajectory[i].Target = trajectory[i].Target + " --fake-flag"
+				break
+			}
+		}
 	}
 
 	b, err := json.MarshalIndent(trajectory, "", "  ")
