@@ -123,3 +123,49 @@ int probe_ssl_write(struct pt_regs *ctx)
 	bpf_ringbuf_output(&ssl_events, e, sizeof(e->hdr) + len, 0);
 	return 0;
 }
+
+struct task_newtask_ctx {
+	__u64 pad;
+	__s32 pid;
+	char comm[16];
+	__u64 clone_flags;
+	__s16 oom_score_adj;
+};
+
+#define CLONE_THREAD 0x10000
+
+SEC("tracepoint/task/task_newtask")
+int handle_fork(struct task_newtask_ctx *ctx)
+{
+	__u32 parent_pid = bpf_get_current_pid_tgid() >> 32;
+	__u32 child_pid = ctx->pid;
+
+	__u8 *p = bpf_map_lookup_elem(&tracked_pids, &parent_pid);
+	if (!p)
+		return 0;
+
+	__u8 one = 1;
+	bpf_map_update_elem(&tracked_pids, &child_pid, &one, BPF_ANY);
+	return 0;
+}
+
+struct sched_process_exit_ctx {
+	__u64 pad;
+	char comm[16];
+	__s32 pid;
+	__s32 prio;
+};
+
+SEC("tracepoint/sched/sched_process_exit")
+int handle_exit(struct sched_process_exit_ctx *ctx)
+{
+	__u64 id = bpf_get_current_pid_tgid();
+	__u32 tgid = id >> 32;
+	__u32 tid = (__u32)id;
+
+	if (tgid != tid)
+		return 0;
+
+	bpf_map_delete_elem(&tracked_pids, &tgid);
+	return 0;
+}

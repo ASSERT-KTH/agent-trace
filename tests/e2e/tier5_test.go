@@ -113,9 +113,16 @@ func runTier5MockAgent(t *testing.T, attack string) (models.Trajectory, models.G
 		g = append(g, e)
 	}
 	t.Logf("Ground truth events collected: %d", len(g))
-	t.Logf("TLS Attach Error: %v", netObs.TLSAttachError())
 	t.Logf("Net Observer Coverage: %+v", netObs.Coverage())
 
+	// Content capture can fail open: the SSL_write frames still reach the
+	// correlator and the assertions below still pass, while the uprobe offset
+	// was never actually validated or cached. Fail here instead, so a
+	// regression in validation (e.g. a second goroutine racing the validator
+	// for the ssl ring buffer) cannot hide behind a green Tier 5 run.
+	if err := netObs.TLSAttachError(); err != nil {
+		t.Fatalf("TLS content capture did not attach: %v", err)
+	}
 
 	// Build the trajectory manually
 	var tr models.Trajectory

@@ -36,6 +36,8 @@ const (
 	tlsbpfMapSslEvents      = "ssl_events"
 	tlsbpfMapSslHeap        = "ssl_heap"
 	tlsbpfMapTrackedPids    = "tracked_pids"
+	tlsbpfProgHandleExit    = "handle_exit"
+	tlsbpfProgHandleFork    = "handle_fork"
 	tlsbpfProgProbeSslWrite = "probe_ssl_write"
 )
 
@@ -81,6 +83,8 @@ type tlsbpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type tlsbpfProgramSpecs struct {
+	HandleExit    *ebpf.ProgramSpec `ebpf:"handle_exit"`
+	HandleFork    *ebpf.ProgramSpec `ebpf:"handle_fork"`
 	ProbeSslWrite *ebpf.ProgramSpec `ebpf:"probe_ssl_write"`
 }
 
@@ -145,11 +149,15 @@ type tlsbpfVariables struct {
 //
 // It can be passed to loadTlsbpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type tlsbpfPrograms struct {
+	HandleExit    *ebpf.Program `ebpf:"handle_exit"`
+	HandleFork    *ebpf.Program `ebpf:"handle_fork"`
 	ProbeSslWrite *ebpf.Program `ebpf:"probe_ssl_write"`
 }
 
 func (p *tlsbpfPrograms) Close() error {
 	return _TlsbpfClose(
+		p.HandleExit,
+		p.HandleFork,
 		p.ProbeSslWrite,
 	)
 }

@@ -106,6 +106,8 @@ type Observer struct {
 	sendtoLink  link.Link
 	sendmsgLink link.Link
 	closeLink   link.Link
+	forkLink    link.Link
+	exitLink    link.Link
 	reader      *ringbuf.Reader
 	events      chan models.GroundTruthEvent
 	stopped     chan struct{}
@@ -122,6 +124,8 @@ type Observer struct {
 	// did before this slice existed.
 	tlsObjs      tlsbpfObjects
 	sslWriteLink link.Link
+	tlsForkLink  link.Link
+	tlsExitLink  link.Link
 	exe          *link.Executable
 	sslReader    *ringbuf.Reader
 
@@ -130,6 +134,17 @@ type Observer struct {
 	tlsCache        *tlsoffset.Cache
 	tlsAttachErr    error
 	validationFrame *sslRecord // the frame that validated the chosen candidate; correlate() must not drop it
+
+	// tlsReady is closed by Start once attachAndValidateTLS has finished (or
+	// immediately, when content capture was never configured). It exists to
+	// keep exactly one goroutine reading o.sslReader at a time: ringbuf.Reader
+	// holds its internal mutex for the whole of a blocking Read, so a feeder
+	// goroutine parked in Read starves the validator -- which then reports
+	// "no candidate validated" even though the offset was right and the
+	// feeder was receiving its frames. The ssl feeder waits here; the
+	// validator owns the reader until it closes.
+	tlsReady  chan struct{}
+	tlsActive bool // content capture validated and attached; read only after <-tlsReady
 
 	pending  map[sslKey]*tlsparse.Stream
 	coverage Coverage
@@ -210,8 +225,33 @@ func New(cfg Config) (*Observer, error) {
 		return nil, fmt.Errorf("attach sys_enter_close: %w", err)
 	}
 
+	forkLink, err := link.Tracepoint("task", "task_newtask", objs.HandleFork, nil)
+	if err != nil {
+		_ = closeLink.Close()
+		_ = sendmsgLink.Close()
+		_ = sendtoLink.Close()
+		_ = writeLink.Close()
+		_ = connectLink.Close()
+		_ = objs.Close()
+		return nil, fmt.Errorf("attach task_newtask: %w", err)
+	}
+
+	exitLink, err := link.Tracepoint("sched", "sched_process_exit", objs.HandleExit, nil)
+	if err != nil {
+		_ = forkLink.Close()
+		_ = closeLink.Close()
+		_ = sendmsgLink.Close()
+		_ = sendtoLink.Close()
+		_ = writeLink.Close()
+		_ = connectLink.Close()
+		_ = objs.Close()
+		return nil, fmt.Errorf("attach sched_process_exit: %w", err)
+	}
+
 	reader, err := ringbuf.NewReader(objs.NetEvents)
 	if err != nil {
+		_ = exitLink.Close()
+		_ = forkLink.Close()
 		_ = closeLink.Close()
 		_ = sendmsgLink.Close()
 		_ = sendtoLink.Close()
@@ -228,9 +268,12 @@ func New(cfg Config) (*Observer, error) {
 		sendtoLink:   sendtoLink,
 		sendmsgLink:  sendmsgLink,
 		closeLink:    closeLink,
+		forkLink:     forkLink,
+		exitLink:     exitLink,
 		reader:       reader,
 		events:       make(chan models.GroundTruthEvent, cfg.EventBufSize),
 		stopped:      make(chan struct{}),
+		tlsReady:     make(chan struct{}),
 		cfg:          cfg,
 		bootOffsetNs: bootOffsetNs,
 		conns:        make(map[connKeyGo]*connection),
@@ -314,6 +357,21 @@ func (o *Observer) prepareTLS(cfg Config) (err error) {
 		return fmt.Errorf("open ssl ring buffer: %w", err)
 	}
 
+	tlsForkLink, err := link.Tracepoint("task", "task_newtask", o.tlsObjs.HandleFork, nil)
+	if err != nil {
+		_ = sslReader.Close()
+		return fmt.Errorf("attach tls task_newtask: %w", err)
+	}
+
+	tlsExitLink, err := link.Tracepoint("sched", "sched_process_exit", o.tlsObjs.HandleExit, nil)
+	if err != nil {
+		_ = tlsForkLink.Close()
+		_ = sslReader.Close()
+		return fmt.Errorf("attach tls sched_process_exit: %w", err)
+	}
+
+	o.tlsForkLink = tlsForkLink
+	o.tlsExitLink = tlsExitLink
 	o.exe = exe
 	o.sslReader = sslReader
 	o.tlsCache = cache
@@ -329,11 +387,15 @@ func (o *Observer) prepareTLS(cfg Config) (err error) {
 // sorting hint). Called from Start, which blocks on it -- see Start's doc
 // comment for why that's acceptable despite Start having no error return.
 //
-// On success the validated offset is cached by build ID and o.sslWriteLink
-// is set. On failure (no candidate validates within its timeout) it leaves
-// o.sslWriteLink nil, closes o.sslReader, and records the error in
-// o.tlsAttachErr: Observer falls back to identity-only operation exactly as
-// if cfg.ExePath had never been set, rather than failing the whole probe.
+// On success the validated offset is cached by build ID, o.sslWriteLink is
+// set and o.tlsActive becomes true. On failure (no candidate validates
+// within its timeout) it leaves o.sslWriteLink nil, closes o.sslReader, and
+// records the error in o.tlsAttachErr: Observer falls back to identity-only
+// operation exactly as if cfg.ExePath had never been set, rather than
+// failing the whole probe.
+//
+// It must run while it is the only reader of o.sslReader -- see the tlsReady
+// field comment.
 func (o *Observer) attachAndValidateTLS(cfg Config) {
 	timeout := cfg.ValidationTimeout
 	if timeout <= 0 {
@@ -341,13 +403,16 @@ func (o *Observer) attachAndValidateTLS(cfg Config) {
 	}
 
 	var chosen tlsoffset.Candidate
+	var framesSeen int
 	var validated bool
 	for _, cand := range o.tlsCandidates {
 		l, err := o.exe.Uprobe("", o.tlsObjs.ProbeSslWrite, &link.UprobeOptions{Address: cand.FileOff})
 		if err != nil {
 			continue
 		}
-		if rec, ok := validateSSLWriteCandidate(o.sslReader, timeout); ok {
+		rec, seen, ok := validateSSLWriteCandidate(o.sslReader, timeout)
+		framesSeen += seen
+		if ok {
 			o.sslWriteLink = l
 			o.validationFrame = &rec
 			chosen = cand
@@ -357,13 +422,24 @@ func (o *Observer) attachAndValidateTLS(cfg Config) {
 		_ = l.Close()
 	}
 	if !validated {
-		o.tlsAttachErr = fmt.Errorf("no SSL_write candidate validated in %s (%d tried)", cfg.ExePath, len(o.tlsCandidates))
+		// Distinguish "the offset is wrong / nothing wrote" from "the
+		// offset is fine but the plaintext isn't HTTP/1.x". The second case
+		// is what an ALPN-negotiated h2 connection looks like from here, and
+		// reporting it as a failed offset search sends the reader hunting
+		// for a symbol-resolution bug that isn't there.
+		if framesSeen > 0 {
+			o.tlsAttachErr = fmt.Errorf("no SSL_write candidate validated in %s (%d tried): captured %d frame(s), none began with an HTTP/1.x request line -- HTTP/2 plaintext cannot validate an offset, and its content is not parsed",
+				cfg.ExePath, len(o.tlsCandidates), framesSeen)
+		} else {
+			o.tlsAttachErr = fmt.Errorf("no SSL_write candidate validated in %s (%d tried): no frame was captured from a tracked process within %s",
+				cfg.ExePath, len(o.tlsCandidates), timeout)
+		}
 		_ = o.sslReader.Close()
-		o.sslReader = nil
 		return
 	}
 
 	o.sslReader.SetDeadline(time.Time{}) // clear the validation deadline for normal operation
+	o.tlsActive = true
 	_ = o.tlsCache.Store(o.tlsBuildID, tlsoffset.Target{Path: cfg.ExePath, BuildID: o.tlsBuildID, SSLWrite: chosen.FileOff})
 }
 
@@ -373,25 +449,29 @@ func (o *Observer) attachAndValidateTLS(cfg Config) {
 // of discarding it -- a short-lived tracked process may never call
 // SSL_write again after the one write that validated the offset, so
 // dropping this frame would silently lose its content.
-func validateSSLWriteCandidate(reader *ringbuf.Reader, timeout time.Duration) (rec sslRecord, ok bool) {
+//
+// seen reports whether a frame arrived at all (1) or the read timed out /
+// the reader was closed (0), which is what lets the caller tell a wrong
+// offset apart from non-HTTP/1.x plaintext.
+func validateSSLWriteCandidate(reader *ringbuf.Reader, timeout time.Duration) (rec sslRecord, seen int, ok bool) {
 	reader.SetDeadline(time.Now().Add(timeout))
 	record, err := reader.Read()
 	if err != nil {
-		return sslRecord{}, false
+		return sslRecord{}, 0, false
 	}
 	var hdr tlsbpfSslFrameHdr
 	hdrSize := binary.Size(hdr)
 	if len(record.RawSample) < hdrSize {
-		return sslRecord{}, false
+		return sslRecord{}, 1, false
 	}
 	payload := record.RawSample[hdrSize:]
 	if !httpRequestLineRE.Match(payload) {
-		return sslRecord{}, false
+		return sslRecord{}, 1, false
 	}
 	if err := binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &hdr); err != nil {
-		return sslRecord{}, false
+		return sslRecord{}, 1, false
 	}
-	return sslRecord{hdr: hdr, payload: append([]byte(nil), payload...)}, true
+	return sslRecord{hdr: hdr, payload: append([]byte(nil), payload...)}, 1, true
 }
 
 // computeBootOffsetNs pairs a CLOCK_MONOTONIC read with a wall-clock read
@@ -457,18 +537,24 @@ func (o *Observer) Dropped() uint64 {
 	return o.dropped.Load()
 }
 
-// Start validates and attaches the SSL_write uprobe (if content capture was
-// configured -- see attachAndValidateTLS), then begins reading ring-buffer
-// records in a background goroutine. The validation step blocks Start for
-// up to cfg.ValidationTimeout per SSL_write candidate; the probe.Observer
+// Start begins reading ring-buffer records in background goroutines and, if
+// content capture was configured, validates and attaches the SSL_write
+// uprobe (see attachAndValidateTLS). The validation step blocks Start for up
+// to cfg.ValidationTimeout per SSL_write candidate; the probe.Observer
 // interface gives Start no error return, so a validation failure is
 // recorded (see TLSAttachError) and Observer degrades to identity-only
 // operation rather than failing the whole probe.
+//
+// The net ring buffer is drained throughout, including during validation, so
+// a slow or failing validation cannot cost us connection events. The ssl
+// ring buffer is not: its feeder waits on tlsReady so that the validator is
+// its only reader until validation is done.
 func (o *Observer) Start() {
+	go o.correlate()
 	if o.exe != nil {
 		o.attachAndValidateTLS(o.cfg)
 	}
-	go o.correlate()
+	close(o.tlsReady)
 }
 
 // TLSAttachError reports why content capture is inactive, or nil if it
@@ -487,11 +573,20 @@ func (o *Observer) Stop() error {
 	o.stopOnce.Do(func() {
 		_ = o.reader.Close() // unblocks netFeed's Read with ErrClosed
 		if o.sslReader != nil {
-			_ = o.sslReader.Close() // unblocks sslFeed's Read with ErrClosed
+			// Unblocks whichever of attachAndValidateTLS or sslFeed is
+			// reading, with ErrClosed. A failed validation has already
+			// closed it; ringbuf.Reader.Close is idempotent.
+			_ = o.sslReader.Close()
 		}
 		<-o.stopped
 		if o.sslWriteLink != nil {
 			_ = o.sslWriteLink.Close()
+		}
+		if o.tlsForkLink != nil {
+			_ = o.tlsForkLink.Close()
+		}
+		if o.tlsExitLink != nil {
+			_ = o.tlsExitLink.Close()
 		}
 		_ = o.tlsObjs.Close()
 		_ = o.closeLink.Close()
@@ -499,6 +594,8 @@ func (o *Observer) Stop() error {
 		_ = o.sendtoLink.Close()
 		_ = o.writeLink.Close()
 		_ = o.connectLink.Close()
+		_ = o.forkLink.Close()
+		_ = o.exitLink.Close()
 		_ = o.objs.Close()
 	})
 	return nil
@@ -529,37 +626,25 @@ func (o *Observer) correlate() {
 	netCh := make(chan netRecord, 64)
 	go o.netFeed(netCh)
 
-	var sslCh chan sslRecord
-	sslOpen := o.sslReader != nil
-	if sslOpen {
-		sslCh = make(chan sslRecord, 64)
-		go o.sslFeed(sslCh)
-	}
+	sslCh := make(chan sslRecord, 64)
+	go o.sslFeed(sslCh)
 
-	// The frame that validated the chosen SSL_write candidate (see
-	// attachAndValidateTLS) was consumed straight off the ring buffer
-	// before this goroutine, and any feeder, existed. Replay it first so a
-	// tracked process that calls SSL_write only once still gets its
-	// content correlated.
-	if o.validationFrame != nil {
-		ts := time.Unix(0, int64(o.validationFrame.hdr.TsNs)+o.bootOffsetNs)
-		o.handleSSLFrame(o.validationFrame.hdr.Tgid, o.validationFrame.hdr.Tid, o.validationFrame.payload, ts)
-		o.validationFrame = nil
-	}
-
-	netOpen := true
-	for netOpen || sslOpen {
+	// Each feeder's channel is set to nil once it closes: a closed channel is
+	// always ready, so leaving it in the select would spin this goroutine at
+	// 100% CPU until the other feeder finished. A nil channel blocks forever
+	// and drops out of the select instead.
+	for netCh != nil || sslCh != nil {
 		select {
 		case rec, ok := <-netCh:
 			if !ok {
-				netOpen = false
+				netCh = nil
 				continue
 			}
 			o.handleNetRecord(rec)
 
 		case rec, ok := <-sslCh:
 			if !ok {
-				sslOpen = false
+				sslCh = nil
 				continue
 			}
 			ts := time.Unix(0, int64(rec.hdr.TsNs)+o.bootOffsetNs)
@@ -597,8 +682,28 @@ func (o *Observer) netFeed(out chan<- netRecord) {
 	}
 }
 
+// sslFeed decodes ssl_events records for correlate. It does not touch
+// o.sslReader until tlsReady is closed: until then the reader belongs to
+// attachAndValidateTLS, and a second goroutine blocking in Read would hold
+// ringbuf.Reader's mutex and starve the validator (which would then reject
+// a perfectly good offset). Closing tlsReady also publishes o.tlsActive,
+// o.sslReader and o.validationFrame to this goroutine.
 func (o *Observer) sslFeed(out chan<- sslRecord) {
 	defer close(out)
+
+	<-o.tlsReady
+	if !o.tlsActive {
+		return // content capture unconfigured, or validation failed
+	}
+
+	// The frame that validated the chosen SSL_write candidate was consumed
+	// straight off the ring buffer before this goroutine started reading.
+	// Replay it so a tracked process that calls SSL_write only once still
+	// gets its content correlated.
+	if o.validationFrame != nil {
+		out <- *o.validationFrame
+		o.validationFrame = nil
+	}
 
 	var hdr tlsbpfSslFrameHdr
 	hdrSize := binary.Size(hdr)

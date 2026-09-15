@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -24,6 +26,22 @@ import (
 // timeout is generous enough for example.com but short enough to not stall
 // tests indefinitely if the network is unavailable.
 var httpClient = &http.Client{Timeout: 10 * time.Second}
+
+// resolveSingleIPv4 returns one IPv4 address for host, so the caller can pin
+// curl to a single connection target (see the --resolve use below). Mirrors
+// tests/e2e/tier5_test.go's helper of the same name.
+func resolveSingleIPv4(host string) (string, error) {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return "", err
+	}
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no IPv4 address found for %s", host)
+}
 
 
 func main() {
@@ -181,16 +199,22 @@ func main() {
 		log.Fatalf("failed to remove file: %v", err)
 	}
 
-	// 5. Optional HTTPS fetch (Tier 3): make the request from within this
-	// process using net/http so the TCP connection originates from simagent's
-	// own PID. That PID is what the test wires into the net probe's
-	// tracked_pids BPF map, so the tcp_connect tracepoint fires and the
-	// netHello path captures the TLS ClientHello SNI.
+	// 5. Optional HTTPS fetch (Tier 3), in one of two modes.
 	//
-	// Using a subprocess (e.g. curl) would NOT work: the subprocess runs
-	// under a different PID that is not in tracked_pids, making its
-	// connections invisible to the BPF program. It would also pollute the
-	// proc probe's ground truth with unexpected process_exec/exit events.
+	// By default the request is made from within this process using net/http,
+	// so the TCP connection originates from simagent's own PID. That PID is
+	// what the caller wires into the net probe's tracked_pids BPF map, so the
+	// tcp_connect tracepoint fires and the netHello path captures the TLS
+	// ClientHello SNI. Go's crypto/tls is statically linked, though, so the
+	// libssl SSL_write uprobe cannot see the plaintext: this mode exercises
+	// identity-only (NetConnect) verification.
+	//
+	// --fetch-via-curl instead shells out to curl, whose dynamically-linked
+	// libssl the uprobe can attach to, so content-level NetRequest
+	// verification is exercised too. The child is visible to the net probe
+	// because tracked_pids is inherited across fork, and to the proc probe
+	// through ancestry scoping, so its execve/exit must be reported here like
+	// any other action this agent takes.
 	var fetchHost string
 	if fetchURL != "" {
 		u, err := url.Parse(fetchURL)
@@ -199,22 +223,67 @@ func main() {
 		}
 		fetchHost = u.Hostname()
 
-		// Go's crypto/tls sends a proper TLS ClientHello with an SNI
-		// extension on the first write, so the BPF netHello path will
-		// extract the hostname even though we are not using OpenSSL.
 		if fetchViaCurl {
-			args := []string{"-s", "-o", "/dev/null", "-X", fetchMethod}
+			curlPath, err := exec.LookPath("curl")
+			if err != nil {
+				log.Fatalf("failed to find curl in PATH: %v", err)
+			}
+
+			var args []string
+
+			// Content capture reads SSL_write plaintext and parses it as
+			// HTTP/1.x (pkg/tlsparse). Left to itself curl negotiates h2 with
+			// most hosts, whose plaintext is HTTP/2 framing: the probe can
+			// neither validate its uprobe offset against it nor recover a
+			// request from it, so the NetRequest entry recorded below would
+			// have no ground truth to corroborate it. Pin the protocol.
+			args = append(args, "--http1.1")
+
+			// A hostname with several A/AAAA records (example.com is served
+			// from several CDN edges) makes curl open Happy-Eyeballs-style
+			// parallel connections. The losing ones never complete a
+			// handshake, so they carry no SNI and surface as IP-only
+			// net_connect ground truth that no trajectory entry claims. Pin
+			// one address so exactly one connection is opened.
+			if ip, rerr := resolveSingleIPv4(fetchHost); rerr != nil {
+				log.Printf("resolve %s: %v (continuing unpinned; expect extra net_connect ground truth)", fetchHost, rerr)
+			} else {
+				port := u.Port()
+				if port == "" {
+					port = "443"
+				}
+				args = append(args, "--resolve", fetchHost+":"+port+":"+ip)
+			}
+
+			args = append(args, "-s", "-o", "/dev/null", "-X", fetchMethod)
 			if fetchBody != "" {
 				args = append(args, "-d", fetchBody)
 			}
 			args = append(args, fetchURL)
-			
+
+			// The proc probe reports the execve filename followed by
+			// argv[1:], never argv[0], so record the resolved absolute path
+			// the same way the wc step above does.
+			curlCmdLine := strings.Join(append([]string{curlPath}, args...), " ")
+
 			// We must use a short delay so any caller tracking this PID can prepare
 			delay()
-			cmd := exec.Command("curl", args...)
-			if err := cmd.Run(); err != nil {
-				log.Printf("curl failed: %v", err)
+			addEntry(models.ProcessExec, curlCmdLine)
+			cmd := exec.Command(curlPath, args...)
+			runErr := cmd.Run()
+			if runErr != nil {
+				log.Printf("curl failed: %v", runErr)
 			}
+			var curlExitCode int32
+			if cmd.ProcessState != nil {
+				curlExitCode = int32(cmd.ProcessState.ExitCode())
+			}
+			trajectory = append(trajectory, models.TrajectoryEntry{
+				Timestamp:  time.Now(),
+				ActionType: models.ProcessExit,
+				Target:     curlCmdLine,
+				ExitCode:   &curlExitCode,
+			})
 		} else {
 			var bodyReader io.Reader
 			if fetchBody != "" {

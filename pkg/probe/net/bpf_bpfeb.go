@@ -59,6 +59,8 @@ const (
 	bpfMapHeap          = "heap"
 	bpfMapNetEvents     = "net_events"
 	bpfMapTrackedPids   = "tracked_pids"
+	bpfProgHandleExit   = "handle_exit"
+	bpfProgHandleFork   = "handle_fork"
 	bpfProgTraceClose   = "trace_close"
 	bpfProgTraceConnect = "trace_connect"
 	bpfProgTraceSendmsg = "trace_sendmsg"
@@ -108,6 +110,8 @@ type bpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
+	HandleExit   *ebpf.ProgramSpec `ebpf:"handle_exit"`
+	HandleFork   *ebpf.ProgramSpec `ebpf:"handle_fork"`
 	TraceClose   *ebpf.ProgramSpec `ebpf:"trace_close"`
 	TraceConnect *ebpf.ProgramSpec `ebpf:"trace_connect"`
 	TraceSendmsg *ebpf.ProgramSpec `ebpf:"trace_sendmsg"`
@@ -176,6 +180,8 @@ type bpfVariables struct {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
+	HandleExit   *ebpf.Program `ebpf:"handle_exit"`
+	HandleFork   *ebpf.Program `ebpf:"handle_fork"`
 	TraceClose   *ebpf.Program `ebpf:"trace_close"`
 	TraceConnect *ebpf.Program `ebpf:"trace_connect"`
 	TraceSendmsg *ebpf.Program `ebpf:"trace_sendmsg"`
@@ -185,6 +191,8 @@ type bpfPrograms struct {
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
+		p.HandleExit,
+		p.HandleFork,
 		p.TraceClose,
 		p.TraceConnect,
 		p.TraceSendmsg,

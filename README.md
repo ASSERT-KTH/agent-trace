@@ -26,9 +26,10 @@ Verification is built up in tiers of increasing probe coverage:
 - **Tier 0** — core data model, matching, and verification logic, exercised with synthetic trajectories and ground truth.
 - **Tier 1** — filesystem probe (`pkg/probe/fs`, via `fanotify`).
 - **Tier 2** — process probe (`pkg/probe/proc`, via an in-kernel eBPF program on `execve`/`exit_group`/`sched_process_exit`), capturing exec argv, exit codes, and in-kernel timestamps.
-- **Tier 4 (in progress)** — filesystem content verification: SHA-256 of a file's initial contents is recorded at `FAN_OPEN` and final contents at `FAN_CLOSE_WRITE`.
+- **Tier 3** — network probe (`pkg/probe/net`), occurrence-level: an eBPF program at the socket layer records peer IP/port and, when the connection is TLS, the ClientHello SNI hostname, without decrypting anything.
+- **Tier 4** — content-level verification: SHA-256 of a file's initial contents is recorded at `FAN_OPEN` and final contents at `FAN_CLOSE_WRITE`; for TLS traffic, a `SSL_write` uprobe captures request plaintext and the HTTP Host header, so the network probe can also compare the request body hash and canonical URL (not just the hostname).
 
-Tier 3 (network), remaining Tier 4 evidence capture, Tier 5 (attack simulation), and Tier 6 (real-agent integration) are planned.
+The standalone attack-generator suite (doc's Tier 5) and real-agent integration (Tier 6) are planned; see `docs/plan/03_tiers_3_to_6.md`.
 
 ## Architecture
 
@@ -40,6 +41,9 @@ pkg/verification  Trajectory-vs-ground-truth comparison and verdict classificati
 pkg/probe         Observer interface every probe implements (used by cmd/watch)
 pkg/probe/fs      Tier 1 filesystem observer (fanotify)
 pkg/probe/proc    Tier 2 process observer (eBPF: execve, exit_group, sched_process_exit)
+pkg/probe/net     Tier 3/4 network observer (eBPF: socket connect + SSL_write uprobe)
+pkg/tlsparse      Pure-Go TLS ClientHello/SNI and HTTP/1.1 request-line parsing
+pkg/tlsoffset     ELF scanner that locates SSL_write in a target libssl for the uprobe
 cmd/simagent      Simulated agent that performs real filesystem/process actions and
                   emits a matching trajectory, for exercising the probes end to end
 cmd/watch         Ground-truth recorder CLI: runs the requested probes live, prints
@@ -54,9 +58,10 @@ tests/e2e         End-to-end scenarios wiring simagent + probes + verification t
 ## Requirements
 
 - Go 1.25+
-- Linux with eBPF support (Tier 2 probe and its tests)
+- Linux with eBPF support (Tier 2/3/4 probes and their tests)
 - `clang` and kernel headers, for regenerating the eBPF bytecode (`bpf2go`)
-- Root privileges, for running the fs/proc probes and their tests (they use `fanotify` and load eBPF programs)
+- Root privileges, for running the fs/proc/net probes and their tests (they use `fanotify` and load eBPF programs, including a uprobe on `SSL_write`)
+- A dynamically-linked `libssl` (from `curl` or `openssl`), for the Tier 4 network content-capture demo below
 
 ## Build & test
 
@@ -106,8 +111,30 @@ To watch an agent `watch` cannot be the parent of (e.g. a container entrypoint),
 
 This prints a FAITHFUL verdict with a per-category breakdown. To see the NOT FAITHFUL path, rerun `simagent` with `--drop-entry 0` (or any valid index) to omit a self-reported action before it's written out, then `verify` again — `Unrecorded` will be non-empty and the verdict flips.
 
-This harness is meant to grow with the project: `pkg/probe.Observer` is the interface every probe implements, and `cmd/watch`'s `probeBuilders` map is a single-entry extension point, so adding Tier 3's network probe (once it exists) means adding one build function, not a new tool.
+This harness is meant to grow with the project: `pkg/probe.Observer` is the interface every probe implements, and `cmd/watch`'s `probeBuilders` map is a single-entry extension point — the network probe below is one entry in that map, not a separate tool.
+
+### Network demo (Tier 3/4)
+
+The same three binaries also exercise the network probe. It needs the path to a dynamically-linked `libssl` so its `SSL_write` uprobe can attach and capture TLS request plaintext (identity-only SNI capture works without this, but skips content-level `NetRequest` verification):
+
+```sh
+LIBSSL=$(ldd "$(which curl)" | awk '/libssl\.so/ {print $3}')
+
+sudo ./watch --probes fs,proc,net --net-exe-path "$LIBSSL" \
+	--workspace /tmp/agent-trace-demo --out ground_truth.json -- \
+	./simagent --workspace /tmp/agent-trace-demo --trajectory-out trajectory.json \
+		--fetch-url https://example.com/api --fetch-method POST --fetch-body content-body \
+		--fetch-via-curl --emit-net-request
+
+./verify --trajectory trajectory.json --ground-truth ground_truth.json
+```
+
+`--fetch-via-curl` runs the fetch as a `curl` subprocess so the uprobe attaches to a real, dynamically-linked TLS stack, rather than Go's statically-linked `crypto/tls`. The subprocess is visible to the net probe because `tracked_pids` is inherited across `fork` (a `task_newtask` tracepoint), and its `execve`/`exit` are visible to the proc probe through ancestry scoping, so `simagent` records a `ProcessExec`/`ProcessExit` pair for it alongside the network entries. It also records a `NetRequest` entry with the SHA-256 of `--fetch-body` as its `RequestHash`; the net probe independently recovers the same hash from the captured `SSL_write` plaintext, and `verify` reports it as Corroborated. Drop `--fetch-via-curl` to fall back to Go's `net/http` and exercise identity-only `NetConnect` matching (SNI, no content hash) instead.
+
+Two constraints are baked into that `curl` invocation, and any real agent under content-level verification is subject to both. Content capture parses `SSL_write` plaintext as HTTP/1.x, so `simagent` passes `--http1.1`: over an ALPN-negotiated h2 connection the plaintext is HTTP/2 framing, which yields no `NetRequest` ground truth (the probe counts it under `unsupported`/`unattributed` in its coverage line) and leaves the agent's own `NetRequest` claim Unwitnessed. And a hostname with several A/AAAA records makes `curl` open Happy-Eyeballs-style parallel connections whose losers complete no handshake, carry no SNI, and surface as IP-only `net_connect` events no trajectory claims; `simagent` therefore resolves one IPv4 itself and pins `curl` to it with `--resolve`.
+
+To see network fabrication or omission caught, add `--attack net-fabrication` (a claimed connection to a host never actually contacted) or `--attack net-omission` (a real connection dropped from the trajectory before it's written) to the `simagent` invocation above — `Unwitnessed`/`Unrecorded` will be non-empty for the `NetConnect`/`NetRequest` entries and the verdict flips to NOT FAITHFUL.
 
 ## Project status
 
-This is a research prototype under active development. Tiers 0-2 are implemented and tested; Tiers 3-6 are not yet built.
+This is a research prototype under active development. Tiers 0, 1, 2, 3, and the network/file portions of Tier 4 are implemented and tested. The standalone attack-generator suite and real-agent integration (Tier 6) are not yet built.
