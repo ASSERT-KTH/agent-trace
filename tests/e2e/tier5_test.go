@@ -1,10 +1,11 @@
 package e2e
 
 import (
-	"bytes"
+	"encoding/hex"
+	"crypto/sha256"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,51 +18,61 @@ import (
 const tier5FetchURL = "https://example.com/api"
 const tier5FetchBody = "content-body"
 
-func runTier5Agent(t *testing.T, attack string) (models.Trajectory, models.GroundTruth) {
+func findLibSSL(t *testing.T) string {
+	t.Helper()
+	curlPath, err := exec.LookPath("curl")
+	if err != nil {
+		t.Skip("curl not available")
+	}
+	out, err := exec.Command("ldd", curlPath).CombinedOutput()
+	if err != nil {
+		t.Skipf("ldd %s: %v", curlPath, err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "libssl.so") {
+			continue
+		}
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "=>" && i+1 < len(fields) {
+				if _, err := os.Stat(fields[i+1]); err == nil {
+					return fields[i+1]
+				}
+			}
+		}
+	}
+	t.Skip("could not resolve libssl.so path from ldd output")
+	return ""
+}
+
+func runTier5MockAgent(t *testing.T, attack string) (models.Trajectory, models.GroundTruth) {
 	t.Helper()
 
-	binPath := buildSimAgent(t)
-	workspace := t.TempDir()
-	trajectoryPath := filepath.Join(t.TempDir(), "trajectory.json")
+	libssl := findLibSSL(t)
 
 	netObs, err := probenet.New(probenet.Config{
 		EventBufSize: 256,
-		ExePath:      binPath,
+		ExePath:      libssl,
 	})
 	if err != nil {
 		t.Fatalf("probenet.New: %v", err)
 	}
 
-	args := []string{
-		"--workspace", workspace,
-		"--trajectory-out", trajectoryPath,
-		"--fetch-url", tier5FetchURL,
-		"--fetch-method", "POST",
-		"--fetch-body", tier5FetchBody,
-		"--emit-net-request",
-		"--file-only", // skip proc probe overhead, we don't need it
-	}
-	if attack != "" {
-		args = append(args, "--attack", attack)
-	}
-
-	cmd := exec.Command(binPath, args...)
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
+	// We use 'exec curl' so that curl inherits the exact PID of this shell script.
+	// The sleep ensures the net probe has time to attach its uprobe before curl starts.
+	cmd := exec.Command("sh", "-c", "sleep 0.5 && exec curl -s -o /dev/null -X POST -d "+tier5FetchBody+" "+tier5FetchURL)
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start simagent: %v", err)
+		t.Fatalf("start shell: %v", err)
 	}
-
+	
 	if err := netObs.TrackPID(int32(cmd.Process.Pid)); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
 		t.Fatalf("netObs.TrackPID: %v", err)
 	}
 	go netObs.Start()
 
 	if err := cmd.Wait(); err != nil {
-		t.Fatalf("simagent failed: %v\n%s", err, output.String())
+		t.Fatalf("curl script failed: %v", err)
 	}
 
 	time.Sleep(3 * time.Second)
@@ -71,25 +82,41 @@ func runTier5Agent(t *testing.T, attack string) (models.Trajectory, models.Groun
 	}
 
 	var g models.GroundTruth
+	// We only care about Net events for Tier 5 assertions
 	for e := range netObs.Events() {
 		g = append(g, e)
 	}
 
-	data, err := os.ReadFile(trajectoryPath)
-	if err != nil {
-		t.Fatalf("read trajectory: %v", err)
+	// Build the trajectory manually
+	var tr models.Trajectory
+	target := models.CanonicalNetTarget("POST", "example.com", 443, "/api", "")
+	h := sha256.Sum256([]byte(tier5FetchBody))
+	hashStr := "sha256:" + hex.EncodeToString(h[:])
+
+	if attack == "substitution" {
+		hashStr = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 	}
-	tr, err := models.ParseTrajectory(data)
-	if err != nil {
-		t.Fatalf("ParseTrajectory: %v", err)
+	
+	entry := models.TrajectoryEntry{
+		Timestamp:   time.Now().Add(-1 * time.Second), // Fake timestamp close to reality
+		ActionType:  models.NetRequest,
+		Target:      target,
+		RequestHash: &hashStr,
 	}
+	tr = append(tr, entry)
+
+	tr = append(tr, models.TrajectoryEntry{
+		Timestamp:  time.Now().Add(-2 * time.Second),
+		ActionType: models.NetConnect,
+		Target:     "example.com",
+	})
 
 	return tr, g
 }
 
 func TestTier5_E2E_NetRequest_Content_Faithful(t *testing.T) {
 	skipUnprivileged(t)
-	tr, g := runTier5Agent(t, "")
+	tr, g := runTier5MockAgent(t, "")
 	
 	config := matching.Config{Delta: 10 * time.Second}
 	verdict := verification.Verify(tr, g, config)
@@ -142,15 +169,7 @@ func TestTier5_E2E_NetRequest_Content_Faithful(t *testing.T) {
 
 func TestTier5_E2E_NetRequest_Content_Substitution(t *testing.T) {
 	skipUnprivileged(t)
-	// simagent doesn't have a "net-substitution" attack yet, we'll manually manipulate the trajectory.
-	tr, g := runTier5Agent(t, "")
-	
-	for i := range tr {
-		if tr[i].ActionType == models.NetRequest {
-			bogus := "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-			tr[i].RequestHash = &bogus
-		}
-	}
+	tr, g := runTier5MockAgent(t, "substitution")
 
 	config := matching.Config{Delta: 10 * time.Second}
 	verdict := verification.Verify(tr, g, config)

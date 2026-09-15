@@ -266,7 +266,7 @@ func TestTier2_E2E_NotFaithful_Substitution(t *testing.T) {
 func TestTier2_E2E_NotFaithful_CommandSwap(t *testing.T) {
 	skipUnprivileged(t)
 
-	tr, g := runTier2Agent(t, "substitution-cmd")
+	tr, g := runTier2Agent(t, "--attack", "substitution-cmd")
 
 	config := tier2Config()
 	verdict := verification.Verify(tr, g, config)
