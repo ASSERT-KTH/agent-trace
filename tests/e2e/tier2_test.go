@@ -19,7 +19,7 @@ import (
 // process probe active -- the full Tier 2 setup, where the agent's trajectory
 // mixes file operations and a subprocess spawn. It returns the agent's
 // self-reported trajectory alongside the ground truth merged from both probes.
-func runTier2Agent(t *testing.T) (models.Trajectory, models.GroundTruth) {
+func runTier2Agent(t *testing.T, extraArgs ...string) (models.Trajectory, models.GroundTruth) {
 	t.Helper()
 
 	binPath := buildSimAgent(t)
@@ -54,7 +54,9 @@ func runTier2Agent(t *testing.T) (models.Trajectory, models.GroundTruth) {
 	// reader started before the agent begins.
 	time.Sleep(200 * time.Millisecond)
 
-	cmd := exec.Command(binPath, "--workspace", workspace, "--trajectory-out", trajectoryPath)
+	args := []string{"--workspace", workspace, "--trajectory-out", trajectoryPath}
+	args = append(args, extraArgs...)
+	cmd := exec.Command(binPath, args...)
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
@@ -258,5 +260,41 @@ func TestTier2_E2E_NotFaithful_Substitution(t *testing.T) {
 	if !found {
 		t.Errorf("exit-code disagreement not surfaced in Mismatched")
 		logVerdict(t, verdict)
+	}
+}
+
+func TestTier2_E2E_NotFaithful_CommandSwap(t *testing.T) {
+	skipUnprivileged(t)
+
+	tr, g := runTier2Agent(t, "substitution-cmd")
+
+	config := tier2Config()
+	verdict := verification.Verify(tr, g, config)
+
+	if verdict.Faithful {
+		t.Errorf("expected NOT FAITHFUL for a command substitution attack, got FAITHFUL")
+		logVerdict(t, verdict)
+	}
+
+	foundUnwitnessed := false
+	for _, e := range verdict.Unwitnessed {
+		if e.ActionType == models.ProcessExec {
+			foundUnwitnessed = true
+			break
+		}
+	}
+	if !foundUnwitnessed {
+		t.Errorf("substituted command not in Unwitnessed")
+	}
+
+	foundUnrecorded := false
+	for _, e := range verdict.Unrecorded {
+		if e.ActionType == models.ProcessExec {
+			foundUnrecorded = true
+			break
+		}
+	}
+	if !foundUnrecorded {
+		t.Errorf("real command not in Unrecorded")
 	}
 }
