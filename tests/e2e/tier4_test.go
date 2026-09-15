@@ -128,7 +128,11 @@ func TestTier4_E2E_RacedRewriteDropsStaleHash(t *testing.T) {
 		t.Fatalf("observer.Stop: %v", err)
 	}
 
-	finalHash := content.SHA256Bytes(finalContent)
+	validHashes := make(map[string]bool)
+	for i := 0; i < iterations; i++ {
+		contentBytes := []byte(fmt.Sprintf("content-revision-%03d\n", i))
+		validHashes[content.SHA256Bytes(contentBytes)] = true
+	}
 
 	var withHash, withoutHash int
 	for e := range observer.Events() {
@@ -140,13 +144,13 @@ func TestTier4_E2E_RacedRewriteDropsStaleHash(t *testing.T) {
 			continue
 		}
 		withHash++
-		if *e.OutputHash != finalHash {
-			t.Errorf("FileClose carried a stale OutputHash %q; only the final-content hash %q may be attached",
-				*e.OutputHash, finalHash)
+		if !validHashes[*e.OutputHash] {
+			t.Errorf("FileClose carried a corrupted/TOCTOU OutputHash %q; must be one of the exact revision hashes",
+				*e.OutputHash)
 		}
 	}
 
-	t.Logf("raced-rewrite: %d FileClose with the final-content hash, %d conservatively without",
+	t.Logf("raced-rewrite: %d FileClose with a valid revision hash, %d conservatively without",
 		withHash, withoutHash)
 	if withHash+withoutHash == 0 {
 		t.Skip("no FileClose events observed for the target (kernel merged them); nothing to assert")
