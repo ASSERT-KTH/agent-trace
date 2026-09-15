@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"flag"
 	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,18 +16,26 @@ import (
 	"github.com/agent-trace/agent-trace/pkg/models"
 )
 
+// httpClient is used for the optional --fetch-url HTTPS request. A 10-second
+// timeout is generous enough for example.com but short enough to not stall
+// tests indefinitely if the network is unavailable.
+var httpClient = &http.Client{Timeout: 10 * time.Second}
+
+
 func main() {
 	var workspace string
 	var trajectoryOut string
 	var dropEntry int
 	var fileOnly bool
 	var attack string
+	var fetchURL string
 
 	flag.StringVar(&workspace, "workspace", "", "Path to the workspace directory")
 	flag.StringVar(&trajectoryOut, "trajectory-out", "", "Path to write the trajectory JSON")
 	flag.IntVar(&dropEntry, "drop-entry", -1, "Zero-based index of a trajectory entry to omit before writing (simulates an omission attack for manual testing; -1 disables)")
 	flag.BoolVar(&fileOnly, "file-only", false, "Skip the subprocess step, producing a trajectory with only filesystem actions (for Tier 1, where no process probe runs)")
-	flag.StringVar(&attack, "attack", "", "Simulate an attack scenario: 'omission', 'fabrication', 'substitution-exit', 'substitution-hash', 'substitution-cmd'")
+	flag.StringVar(&attack, "attack", "", "Simulate an attack scenario: 'omission', 'fabrication', 'substitution-exit', 'substitution-hash', 'substitution-cmd', 'net-omission', 'net-fabrication'")
+	flag.StringVar(&fetchURL, "fetch-url", "", "If set, run `curl -s -o /dev/null -m 10 <url>` and record a NetConnect trajectory entry for the host")
 	flag.Parse()
 
 	if workspace == "" || trajectoryOut == "" {
@@ -151,6 +161,40 @@ func main() {
 		log.Fatalf("failed to remove file: %v", err)
 	}
 
+	// 5. Optional HTTPS fetch (Tier 3): make the request from within this
+	// process using net/http so the TCP connection originates from simagent's
+	// own PID. That PID is what the test wires into the net probe's
+	// tracked_pids BPF map, so the tcp_connect tracepoint fires and the
+	// netHello path captures the TLS ClientHello SNI.
+	//
+	// Using a subprocess (e.g. curl) would NOT work: the subprocess runs
+	// under a different PID that is not in tracked_pids, making its
+	// connections invisible to the BPF program. It would also pollute the
+	// proc probe's ground truth with unexpected process_exec/exit events.
+	var fetchHost string
+	if fetchURL != "" {
+		u, err := url.Parse(fetchURL)
+		if err != nil {
+			log.Fatalf("invalid --fetch-url %q: %v", fetchURL, err)
+		}
+		fetchHost = u.Hostname()
+
+		// Go's crypto/tls sends a proper TLS ClientHello with an SNI
+		// extension on the first write, so the BPF netHello path will
+		// extract the hostname even though we are not using OpenSSL.
+		resp, err := httpClient.Get(fetchURL)
+		if err != nil {
+			log.Printf("fetch %s: %v (ignoring for trajectory purposes)", fetchURL, err)
+		} else {
+			resp.Body.Close()
+		}
+
+		// Record what we did: a network connection to the host.
+		addEntry(models.NetConnect, fetchHost)
+
+		delay()
+	}
+
 	if dropEntry >= 0 && dropEntry < len(trajectory) {
 		trajectory = append(trajectory[:dropEntry], trajectory[dropEntry+1:]...)
 	}
@@ -194,6 +238,23 @@ func main() {
 				break
 			}
 		}
+	case "net-omission":
+		// Drop the NetConnect entry — the net probe still saw it, so it
+		// surfaces as Unrecorded in the verifier.
+		filtered := trajectory[:0:0]
+		for _, e := range trajectory {
+			if e.ActionType != models.NetConnect {
+				filtered = append(filtered, e)
+			}
+		}
+		trajectory = filtered
+	case "net-fabrication":
+		// Claim to have connected to a host that was never contacted.
+		trajectory = append(trajectory, models.TrajectoryEntry{
+			Timestamp:  time.Now(),
+			ActionType: models.NetConnect,
+			Target:     "ghost.example.invalid",
+		})
 	}
 
 	b, err := json.MarshalIndent(trajectory, "", "  ")

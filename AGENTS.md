@@ -1,5 +1,13 @@
 # Agent-Trace Repository Guide
 
+## ⚠️ Privileged Commands — NEVER run sudo headlessly
+
+**NEVER attempt to run `sudo` in a background task or unattended terminal.** Sudo requires an interactive password and any attempt to do so will block, fail, or break the environment.
+
+**Instead**: when a privileged test or command is needed (e.g., `sudo go test -v ./...` for eBPF/fanotify tests), **STOP** and ask the user to run it in their own terminal. Wait for them to paste back the output before continuing.
+
+This applies to ALL privileged operations: `sudo go test`, `sudo go run`, any BPF/fanotify program requiring root, etc.
+
 If your harness opened `CLAUDE.md`, `GEMINI.md`, or `CODEX.md` first, read this file next. This is the shared source of truth for all agents in this repo.
 
 This repository contains the Agent Trajectory Faithfulness Verifier, written in Go. Its goal is to provide execution assurance for AI agent trajectories by comparing self-reported actions against ground-truth system probes.

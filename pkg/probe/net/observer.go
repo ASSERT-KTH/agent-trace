@@ -683,6 +683,15 @@ func (o *Observer) emit(key connKeyGo, conn *connection, tgid int32, ts time.Tim
 	if conn.emitted {
 		return
 	}
+	// Port 53 is DNS. DNS lookups are OS-level infrastructure triggered
+	// implicitly by any hostname resolution — the agent does not explicitly
+	// "connect" to a DNS server. Emitting these events would require every
+	// agent trajectory to record DNS connections, which is impractical and
+	// outside the scope of Tier 3's detection goals. Skip silently.
+	if conn.port == 53 {
+		conn.emitted = true // prevent double-emit on close
+		return
+	}
 	conn.emitted = true
 
 	target := conn.host

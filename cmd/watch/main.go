@@ -46,6 +46,7 @@ import (
 	"github.com/agent-trace/agent-trace/pkg/models"
 	"github.com/agent-trace/agent-trace/pkg/probe"
 	"github.com/agent-trace/agent-trace/pkg/probe/fs"
+	probenet "github.com/agent-trace/agent-trace/pkg/probe/net"
 	"github.com/agent-trace/agent-trace/pkg/probe/proc"
 )
 
@@ -64,16 +65,20 @@ type watchConfig struct {
 	// otherwise every process on the host would be recorded as top-level
 	// ground truth during the window before SetRootPID runs.
 	AncestryPending bool
+
+	// NetExePath, when set, enables the SSL_write uprobe on that executable
+	// for content capture (Tier 3 S5+). Empty means identity-only (SNI only).
+	NetExePath string
+
+	// NetCachePath is the JSON cache file for pre-computed TLS offsets.
+	// Defaults to $TMPDIR/agent-trace-tlsoffset-cache.json when empty.
+	NetCachePath string
 }
 
 type builderFunc func(watchConfig) (probe.Observer, error)
 
 // probeBuilders is the extension point: one entry per probe this harness
-// knows how to run. Add a case here when a new tier's probe lands, e.g.:
-//
-//	"net": func(cfg watchConfig) (probe.Observer, error) {
-//		return net.New(net.Config{...})
-//	},
+// knows how to run. Add a case here when a new tier's probe lands.
 var probeBuilders = map[string]builderFunc{
 	"fs": func(cfg watchConfig) (probe.Observer, error) {
 		return fs.New(fs.Config{
@@ -87,6 +92,17 @@ var probeBuilders = map[string]builderFunc{
 			CommandFilter: cfg.ProcFilter,
 			EventBufSize:  cfg.EventBufSize,
 			DeferRootPID:  cfg.AncestryPending,
+		})
+	},
+	// Tier 3 network probe: emits NetConnect events with resolved hostname
+	// (SNI) for each outbound TLS connection from the tracked process. When
+	// cfg.NetExePath is set, the SSL_write uprobe is also attached for
+	// content capture (NetRequest events).
+	"net": func(cfg watchConfig) (probe.Observer, error) {
+		return probenet.New(probenet.Config{
+			EventBufSize: cfg.EventBufSize,
+			ExePath:      cfg.NetExePath,
+			CachePath:    cfg.NetCachePath,
 		})
 	},
 }
@@ -113,6 +129,7 @@ type watchOptions struct {
 func main() {
 	var workspace, probesFlag, procFilter, out string
 	var bufSize, rootPID int
+	var netExePath, netCachePath string
 
 	flag.StringVar(&workspace, "workspace", "", "Path to the workspace to watch (fs probe)")
 	flag.StringVar(&probesFlag, "probes", "fs,proc", "Comma-separated probes to run (available: "+availableProbes()+")")
@@ -120,6 +137,8 @@ func main() {
 	flag.StringVar(&out, "out", "ground_truth.json", "Path to write the captured ground truth JSON on exit")
 	flag.IntVar(&bufSize, "buf", 4096, "Per-probe event channel buffer size")
 	flag.IntVar(&rootPID, "root-pid", 0, "Attach the proc probe's ancestry root to this already-running PID instead of launching the agent. RACE: anything that PID did before this call is invisible to the proc probe (the fs probe is unaffected). Mutually exclusive with a trailing -- <command>.")
+	flag.StringVar(&netExePath, "net-exe-path", "", "Path to the TLS library (e.g. libssl.so.3) for SSL_write content capture (net probe, Tier 3 S5+). Empty = identity-only (SNI).")
+	flag.StringVar(&netCachePath, "net-cache-path", "", "JSON cache file for pre-computed TLS offsets (net probe). Defaults to $TMPDIR/agent-trace-tlsoffset-cache.json.")
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
 		_, _ = fmt.Fprintln(out, "Usage: watch --workspace PATH [flags] [-- <agent command> [args...]]")
@@ -133,7 +152,7 @@ func main() {
 	flag.Parse()
 
 	opts := watchOptions{
-		cfg:       watchConfig{Workspace: workspace, ProcFilter: procFilter, EventBufSize: bufSize},
+		cfg:       watchConfig{Workspace: workspace, ProcFilter: procFilter, EventBufSize: bufSize, NetExePath: netExePath, NetCachePath: netCachePath},
 		probes:    probesFlag,
 		out:       out,
 		rootPID:   rootPID,
@@ -164,11 +183,12 @@ func runWatch(opts watchOptions) error {
 	// global mode for that window -- see watchConfig.AncestryPending.
 	opts.cfg.AncestryPending = len(opts.agentArgs) > 0 || opts.rootPID != 0
 
-	// Build probes. The proc observer is held separately from the rest: its
-	// SetRootPID isn't part of the probe.Observer interface, and its Start
-	// must be sequenced after the ancestry root PID is known.
+	// Build probes. The proc and net observers are held separately from the
+	// rest: their Start must be sequenced after the ancestry root PID is
+	// known so we can call TrackPID / SetRootPID first.
 	var others []probe.Observer
 	var procObs *proc.Observer
+	var netObs *probenet.Observer
 	for _, name := range strings.Split(opts.probes, ",") {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -190,9 +210,17 @@ func runWatch(opts watchOptions) error {
 			procObs = p
 			continue
 		}
+		if name == "net" {
+			n, ok := obs.(*probenet.Observer)
+			if !ok {
+				return fmt.Errorf("net builder returned %T, want *probenet.Observer", obs)
+			}
+			netObs = n
+			continue
+		}
 		others = append(others, obs)
 	}
-	if len(others) == 0 && procObs == nil {
+	if len(others) == 0 && procObs == nil && netObs == nil {
 		return errors.New("no probes selected")
 	}
 	if opts.rootPID != 0 && procObs == nil {
@@ -221,16 +249,22 @@ func runWatch(opts watchOptions) error {
 		}()
 	}
 
-	// Every non-proc observer starts now. The proc observer's readLoop starts
-	// only once its ancestry root PID is known, so the root's own (already
-	// buffered) execve is reliably suppressed by PID -- matching the ordering
-	// in tests/e2e/tier2_test.go's runTier2Agent.
+	// Every non-proc, non-net observer starts now. The proc observer's
+	// readLoop starts only once its ancestry root PID is known, so the
+	// root's own (already buffered) execve is reliably suppressed by PID --
+	// matching the ordering in tests/e2e/tier2_test.go's runTier2Agent.
+	// The net observer is also deferred: TrackPID must be called first so
+	// its BPF tracked_pids map is populated before the agent starts sending
+	// traffic, and Start blocks during TLS validation so it runs in a goroutine.
 	for _, o := range others {
 		collect(o)
 		o.Start()
 	}
 	if procObs != nil {
 		collect(procObs)
+	}
+	if netObs != nil {
+		collect(netObs)
 	}
 
 	procStarted := false
@@ -240,13 +274,31 @@ func runWatch(opts watchOptions) error {
 			procStarted = true
 		}
 	}
+	netStarted := false
+	startNet := func(pid int32) {
+		if netObs != nil && !netStarted {
+			if pid > 0 {
+				if err := netObs.TrackPID(pid); err != nil {
+					log.Printf("net probe TrackPID(%d): %v", pid, err)
+				}
+			}
+			go netObs.Start() // Start blocks during TLS validation; run async.
+			netStarted = true
+		}
+	}
 	stopEverything := func() {
 		// Ensure the proc readLoop exists before Stop, or Stop blocks
 		// forever waiting on a goroutine that was never launched.
 		startProc()
+		startNet(0) // no-op if already started; ensures goroutine+events exist
 		for _, o := range others {
 			if err := o.Stop(); err != nil {
 				log.Printf("stop probe: %v", err)
+			}
+		}
+		if netObs != nil {
+			if err := netObs.Stop(); err != nil {
+				log.Printf("stop net probe: %v", err)
 			}
 		}
 		if procObs != nil {
@@ -286,6 +338,8 @@ func runWatch(opts watchOptions) error {
 			}
 			startProc()
 		}
+		// Wire the agent's PID into the net probe so its connections are visible.
+		startNet(int32(cmd.Process.Pid))
 		fmt.Printf("watching %s (probes: %s) -- running %s\n",
 			opts.cfg.Workspace, opts.probes, strings.Join(opts.agentArgs, " "))
 
@@ -307,12 +361,14 @@ func runWatch(opts watchOptions) error {
 			return fmt.Errorf("set proc probe root pid: %w", err)
 		}
 		startProc()
+		startNet(int32(opts.rootPID))
 		fmt.Printf("watching %s (probes: %s), proc ancestry root pid %d -- press Ctrl+C to stop and write %s\n",
 			opts.cfg.Workspace, opts.probes, opts.rootPID, opts.out)
 		<-sigCh
 
 	default:
 		startProc()
+		startNet(0)
 		fmt.Printf("watching %s (probes: %s) -- press Ctrl+C to stop and write %s\n",
 			opts.cfg.Workspace, opts.probes, opts.out)
 		<-sigCh
@@ -320,6 +376,16 @@ func runWatch(opts watchOptions) error {
 
 	fmt.Println("\nstopping probes...")
 	stopEverything()
+
+	if netObs != nil {
+		cov := netObs.Coverage()
+		fmt.Printf("net probe coverage: connections=%d withHostname=%d withContent=%d unattributed=%d unsupported=%d faultedReads=%d\n",
+			cov.Connections, cov.WithHostname, cov.WithContent,
+			cov.FramesUnattributed, cov.ContentUnsupported, cov.FaultedReads)
+		if err := netObs.TLSAttachError(); err != nil {
+			log.Printf("net probe TLS attach warning: %v", err)
+		}
+	}
 
 	sort.Slice(ground, func(i, j int) bool { return ground[i].Timestamp.Before(ground[j].Timestamp) })
 
