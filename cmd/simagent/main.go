@@ -42,9 +42,11 @@ func main() {
 	flag.StringVar(&fetchURL, "fetch-url", "", "If set, run `curl -s -o /dev/null -m 10 <url>` and record a NetConnect trajectory entry for the host")
 	var fetchMethod, fetchBody string
 	var emitNetRequest bool
+	var fetchViaCurl bool
 	flag.StringVar(&fetchMethod, "fetch-method", "GET", "HTTP method to use for fetch (simulates net request)")
 	flag.StringVar(&fetchBody, "fetch-body", "", "HTTP body to send (for POST/PUT)")
 	flag.BoolVar(&emitNetRequest, "emit-net-request", false, "Emit a NetRequest entry with RequestHash instead of just NetConnect")
+	flag.BoolVar(&fetchViaCurl, "fetch-via-curl", false, "Use curl subprocess instead of net/http for network request")
 
 	flag.Parse()
 
@@ -200,20 +202,35 @@ func main() {
 		// Go's crypto/tls sends a proper TLS ClientHello with an SNI
 		// extension on the first write, so the BPF netHello path will
 		// extract the hostname even though we are not using OpenSSL.
-		var bodyReader io.Reader
-		if fetchBody != "" {
-			bodyReader = strings.NewReader(fetchBody)
-		}
-		req, err := http.NewRequest(fetchMethod, fetchURL, bodyReader)
-		if err != nil {
-			log.Fatalf("new request: %v", err)
-		}
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			log.Printf("fetch %s: %v (ignoring for trajectory purposes)", fetchURL, err)
+		if fetchViaCurl {
+			args := []string{"-s", "-o", "/dev/null", "-X", fetchMethod}
+			if fetchBody != "" {
+				args = append(args, "-d", fetchBody)
+			}
+			args = append(args, fetchURL)
+			
+			// We must use a short delay so any caller tracking this PID can prepare
+			delay()
+			cmd := exec.Command("curl", args...)
+			if err := cmd.Run(); err != nil {
+				log.Printf("curl failed: %v", err)
+			}
 		} else {
-			_ = resp.Body.Close()
+			var bodyReader io.Reader
+			if fetchBody != "" {
+				bodyReader = strings.NewReader(fetchBody)
+			}
+			req, err := http.NewRequest(fetchMethod, fetchURL, bodyReader)
+			if err != nil {
+				log.Fatalf("new request: %v", err)
+			}
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				log.Printf("fetch %s: %v (ignoring for trajectory purposes)", fetchURL, err)
+			} else {
+				_ = resp.Body.Close()
+			}
 		}
 
 		// Record what we did: a network connection to the host.

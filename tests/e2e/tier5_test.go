@@ -3,6 +3,8 @@ package e2e
 import (
 	"encoding/hex"
 	"crypto/sha256"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -46,6 +48,20 @@ func findLibSSL(t *testing.T) string {
 	return ""
 }
 
+func resolveSingleIPv4(t *testing.T, host string) (string, error) {
+	t.Helper()
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return "", err
+	}
+	for _, addr := range addrs {
+		if v4 := addr.To4(); v4 != nil {
+			return v4.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no IPv4 address found for %s", host)
+}
+
 func runTier5MockAgent(t *testing.T, attack string) (models.Trajectory, models.GroundTruth) {
 	t.Helper()
 
@@ -59,9 +75,19 @@ func runTier5MockAgent(t *testing.T, attack string) (models.Trajectory, models.G
 		t.Fatalf("probenet.New: %v", err)
 	}
 
+	// example.com resolves to multiple CDN edge IPs over IPv4/IPv6; curl performs
+	// Happy-Eyeballs-style parallel connection attempts against all of them, which
+	// would surface as extra unattributed net_connect ground-truth events for the
+	// addresses that never complete a TLS handshake. Pin curl to a single resolved
+	// IPv4 address so exactly one connection is opened.
+	ip, err := resolveSingleIPv4(t, "example.com")
+	if err != nil {
+		t.Fatalf("resolve example.com: %v", err)
+	}
+
 	// We use 'exec curl' so that curl inherits the exact PID of this shell script.
 	// The sleep ensures the net probe has time to attach its uprobe before curl starts.
-	cmd := exec.Command("sh", "-c", "sleep 0.5 && exec curl -s -o /dev/null -X POST -d "+tier5FetchBody+" "+tier5FetchURL)
+	cmd := exec.Command("sh", "-c", "sleep 0.5 && exec curl --http1.1 --resolve example.com:443:"+ip+" -s -o /dev/null -X POST -d "+tier5FetchBody+" "+tier5FetchURL)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start shell: %v", err)
 	}
@@ -86,6 +112,10 @@ func runTier5MockAgent(t *testing.T, attack string) (models.Trajectory, models.G
 	for e := range netObs.Events() {
 		g = append(g, e)
 	}
+	t.Logf("Ground truth events collected: %d", len(g))
+	t.Logf("TLS Attach Error: %v", netObs.TLSAttachError())
+	t.Logf("Net Observer Coverage: %+v", netObs.Coverage())
+
 
 	// Build the trajectory manually
 	var tr models.Trajectory

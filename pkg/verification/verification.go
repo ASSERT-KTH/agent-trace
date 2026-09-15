@@ -134,6 +134,10 @@ func Verify(t models.Trajectory, g models.GroundTruth, cfg matching.Config) Verd
 			entry.ExitCode == nil && g[bestIdx].ExitCode != nil {
 			exitOK = false
 		}
+		if entry.ActionType == models.NetRequest &&
+			entry.RequestHash == nil && g[bestIdx].RequestHash != nil {
+			requestOK = false
+		}
 
 		if inputOK && outputOK && exitOK && requestOK {
 			v.Corroborated = append(v.Corroborated, pair)
