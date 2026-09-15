@@ -21,6 +21,9 @@ import (
 	"errors"
 	"fmt"
 	stdnet "net"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -33,6 +36,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/agent-trace/agent-trace/pkg/models"
+	"github.com/agent-trace/agent-trace/pkg/tlsoffset"
 	"github.com/agent-trace/agent-trace/pkg/tlsparse"
 )
 
@@ -62,6 +66,23 @@ type Config struct {
 	// EventBufSize is the channel buffer size for emitted events. Defaults
 	// to 4096 if zero.
 	EventBufSize int
+
+	// ExePath, if set, is the executable to attach the SSL_write uprobe to
+	// for content capture (S5). Without it, Observer runs identity-only,
+	// exactly as in S3: NetConnect events with a resolved hostname, no
+	// NetRequest events. Required for TrackedPID's process to yield
+	// request-level content.
+	ExePath string
+
+	// CachePath is the tlsoffset JSON cache file. Defaults to
+	// $TMPDIR/agent-trace-tlsoffset-cache.json. Only used when ExePath is
+	// set.
+	CachePath string
+
+	// ValidationTimeout bounds how long Observer.New waits for a candidate
+	// SSL_write offset to produce a parseable HTTP request before trying
+	// the next candidate, per design doc section 9. Defaults to 5s.
+	ValidationTimeout time.Duration
 }
 
 // connection is per-connection correlator state, keyed by (tgid, fd).
@@ -95,6 +116,23 @@ type Observer struct {
 	bootOffsetNs int64
 
 	conns map[connKeyGo]*connection
+
+	// Content-capture (S5) state. tlsObjs and sslWriteLink are zero/nil
+	// when cfg.ExePath is unset -- Observer then runs identity-only, as it
+	// did before this slice existed.
+	tlsObjs      tlsbpfObjects
+	sslWriteLink link.Link
+	exe          *link.Executable
+	sslReader    *ringbuf.Reader
+
+	tlsCandidates   []tlsoffset.Candidate
+	tlsBuildID      string
+	tlsCache        *tlsoffset.Cache
+	tlsAttachErr    error
+	validationFrame *sslRecord // the frame that validated the chosen candidate; correlate() must not drop it
+
+	pending  map[sslKey]*tlsparse.Stream
+	coverage Coverage
 }
 
 // connKeyGo mirrors net.bpf.c's conn_key; it is the correlator's own map
@@ -183,7 +221,7 @@ func New(cfg Config) (*Observer, error) {
 		return nil, fmt.Errorf("open ring buffer: %w", err)
 	}
 
-	return &Observer{
+	o := &Observer{
 		objs:         objs,
 		connectLink:  connectLink,
 		writeLink:    writeLink,
@@ -196,7 +234,164 @@ func New(cfg Config) (*Observer, error) {
 		cfg:          cfg,
 		bootOffsetNs: bootOffsetNs,
 		conns:        make(map[connKeyGo]*connection),
-	}, nil
+		pending:      make(map[sslKey]*tlsparse.Stream),
+	}
+
+	if cfg.ExePath != "" {
+		if err := o.prepareTLS(cfg); err != nil {
+			_ = reader.Close()
+			_ = closeLink.Close()
+			_ = sendmsgLink.Close()
+			_ = sendtoLink.Close()
+			_ = writeLink.Close()
+			_ = connectLink.Close()
+			_ = objs.Close()
+			return nil, fmt.Errorf("prepare SSL_write content capture: %w", err)
+		}
+	}
+
+	return o, nil
+}
+
+// httpRequestLineRE recognizes an HTTP/1.x request line at the start of a
+// captured buffer, for offset validation only (design doc section 9 step
+// 2-3): "does this candidate's first captured write look like a real
+// SSL_write(request_bytes) call, not some other BoringSSL internal buffer".
+// It is deliberately looser than tlsparse.ParseHTTP1, which needs a
+// complete header block; validation only needs the request line.
+var httpRequestLineRE = regexp.MustCompile(`^[A-Z]{2,10} \S+ HTTP/1\.[01]\r\n`)
+
+// prepareTLS loads tls.bpf.c's objects, seeds its tracked_pids, opens the
+// executable and the ssl_events ring buffer, and resolves SSL_write
+// candidates in cfg.ExePath -- everything content capture needs except the
+// actual uprobe attach, which Start (via attachAndValidateTLS) performs.
+// Splitting attach out of New matches design doc section 9: "Validation is
+// a separate mandatory step performed by net.Observer.Start", not New --
+// because the process(es) whose traffic will validate a candidate may not
+// exist yet at New time.
+func (o *Observer) prepareTLS(cfg Config) (err error) {
+	candidates, buildID, err := tlsoffset.ScanELF(cfg.ExePath)
+	if err != nil {
+		return fmt.Errorf("scan ELF for SSL_write: %w", err)
+	}
+
+	cachePath := cfg.CachePath
+	if cachePath == "" {
+		cachePath = filepath.Join(os.TempDir(), "agent-trace-tlsoffset-cache.json")
+	}
+	cache := tlsoffset.NewCache(cachePath)
+	if cached := cache.Lookup(buildID); cached != nil {
+		candidates = append([]tlsoffset.Candidate{{FileOff: cached.SSLWrite, Score: 1 << 30}}, candidates...)
+	}
+	if len(candidates) == 0 {
+		return fmt.Errorf("no SSL_write candidates found in %s", cfg.ExePath)
+	}
+
+	if err := loadTlsbpfObjects(&o.tlsObjs, nil); err != nil {
+		return fmt.Errorf("load tls eBPF objects: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = o.tlsObjs.Close()
+		}
+	}()
+
+	if cfg.TrackedPID > 0 {
+		p := uint32(cfg.TrackedPID)
+		one := uint8(1)
+		if err := o.tlsObjs.TrackedPids.Update(&p, &one, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update tls tracked_pids: %w", err)
+		}
+	}
+
+	exe, err := link.OpenExecutable(cfg.ExePath)
+	if err != nil {
+		return fmt.Errorf("open executable %s: %w", cfg.ExePath, err)
+	}
+
+	sslReader, err := ringbuf.NewReader(o.tlsObjs.SslEvents)
+	if err != nil {
+		return fmt.Errorf("open ssl ring buffer: %w", err)
+	}
+
+	o.exe = exe
+	o.sslReader = sslReader
+	o.tlsCache = cache
+	o.tlsBuildID = buildID
+	o.tlsCandidates = candidates
+	return nil
+}
+
+// attachAndValidateTLS is design doc section 9's validation step: attach
+// probe_ssl_write at each candidate in turn and require its first captured
+// frame from a tracked process to look like an HTTP/1.x request line (D4:
+// runtime validation is authoritative, the ELF scan's score is only a
+// sorting hint). Called from Start, which blocks on it -- see Start's doc
+// comment for why that's acceptable despite Start having no error return.
+//
+// On success the validated offset is cached by build ID and o.sslWriteLink
+// is set. On failure (no candidate validates within its timeout) it leaves
+// o.sslWriteLink nil, closes o.sslReader, and records the error in
+// o.tlsAttachErr: Observer falls back to identity-only operation exactly as
+// if cfg.ExePath had never been set, rather than failing the whole probe.
+func (o *Observer) attachAndValidateTLS(cfg Config) {
+	timeout := cfg.ValidationTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
+	var chosen tlsoffset.Candidate
+	var validated bool
+	for _, cand := range o.tlsCandidates {
+		l, err := o.exe.Uprobe("", o.tlsObjs.ProbeSslWrite, &link.UprobeOptions{Address: cand.FileOff})
+		if err != nil {
+			continue
+		}
+		if rec, ok := validateSSLWriteCandidate(o.sslReader, timeout); ok {
+			o.sslWriteLink = l
+			o.validationFrame = &rec
+			chosen = cand
+			validated = true
+			break
+		}
+		_ = l.Close()
+	}
+	if !validated {
+		o.tlsAttachErr = fmt.Errorf("no SSL_write candidate validated in %s (%d tried)", cfg.ExePath, len(o.tlsCandidates))
+		_ = o.sslReader.Close()
+		o.sslReader = nil
+		return
+	}
+
+	o.sslReader.SetDeadline(time.Time{}) // clear the validation deadline for normal operation
+	_ = o.tlsCache.Store(o.tlsBuildID, tlsoffset.Target{Path: cfg.ExePath, BuildID: o.tlsBuildID, SSLWrite: chosen.FileOff})
+}
+
+// validateSSLWriteCandidate blocks for up to timeout waiting for one frame
+// on reader and, if it looks like an HTTP/1.x request line, decodes and
+// returns it (ok=true) so the caller can feed it to the correlator instead
+// of discarding it -- a short-lived tracked process may never call
+// SSL_write again after the one write that validated the offset, so
+// dropping this frame would silently lose its content.
+func validateSSLWriteCandidate(reader *ringbuf.Reader, timeout time.Duration) (rec sslRecord, ok bool) {
+	reader.SetDeadline(time.Now().Add(timeout))
+	record, err := reader.Read()
+	if err != nil {
+		return sslRecord{}, false
+	}
+	var hdr tlsbpfSslFrameHdr
+	hdrSize := binary.Size(hdr)
+	if len(record.RawSample) < hdrSize {
+		return sslRecord{}, false
+	}
+	payload := record.RawSample[hdrSize:]
+	if !httpRequestLineRE.Match(payload) {
+		return sslRecord{}, false
+	}
+	if err := binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &hdr); err != nil {
+		return sslRecord{}, false
+	}
+	return sslRecord{hdr: hdr, payload: append([]byte(nil), payload...)}, true
 }
 
 // computeBootOffsetNs pairs a CLOCK_MONOTONIC read with a wall-clock read
@@ -215,14 +410,39 @@ func computeBootOffsetNs() (int64, error) {
 }
 
 // TrackPID adds a PID to tracked_pids so its connections are observed. Safe
-// to call after Start.
+// to call after Start. It updates both net.bpf.c's and, when content
+// capture is active, tls.bpf.c's copy of the map -- see the "gating role"
+// comment on tls.bpf.c's tracked_pids for why there are two.
 func (o *Observer) TrackPID(pid int32) error {
 	p := uint32(pid)
 	one := uint8(1)
 	if err := o.objs.TrackedPids.Update(&p, &one, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update tracked_pids: %w", err)
 	}
+	if o.tlsObjs.TrackedPids != nil {
+		if err := o.tlsObjs.TrackedPids.Update(&p, &one, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update tls tracked_pids: %w", err)
+		}
+	}
 	return nil
+}
+
+// Coverage reports how much of the observed network activity was
+// attributed to content, per design doc section 8. Meaningful to call only
+// after Stop returns; FaultedReads is read directly from the eBPF map and
+// is zero when content capture (cfg.ExePath) was never configured.
+func (o *Observer) Coverage() Coverage {
+	cov := o.coverage
+	if o.tlsObjs.FaultedReads != nil {
+		var perCPU []uint64
+		var zero uint32
+		if err := o.tlsObjs.FaultedReads.Lookup(&zero, &perCPU); err == nil {
+			for _, v := range perCPU {
+				cov.FaultedReads += v
+			}
+		}
+	}
+	return cov
 }
 
 // Events returns the channel on which GroundTruthEvents are delivered. The
@@ -237,30 +457,119 @@ func (o *Observer) Dropped() uint64 {
 	return o.dropped.Load()
 }
 
-// Start begins reading ring-buffer records in a background goroutine.
+// Start validates and attaches the SSL_write uprobe (if content capture was
+// configured -- see attachAndValidateTLS), then begins reading ring-buffer
+// records in a background goroutine. The validation step blocks Start for
+// up to cfg.ValidationTimeout per SSL_write candidate; the probe.Observer
+// interface gives Start no error return, so a validation failure is
+// recorded (see TLSAttachError) and Observer degrades to identity-only
+// operation rather than failing the whole probe.
 func (o *Observer) Start() {
-	go o.readLoop()
+	if o.exe != nil {
+		o.attachAndValidateTLS(o.cfg)
+	}
+	go o.correlate()
 }
 
-// Stop unblocks the read loop, waits for it, and releases all resources.
-// The events channel is closed after Stop returns. Safe to call once.
+// TLSAttachError reports why content capture is inactive, or nil if it
+// never failed (either it's working, or cfg.ExePath was never set). Safe to
+// call after Start returns.
+func (o *Observer) TLSAttachError() error {
+	return o.tlsAttachErr
+}
+
+// Stop unblocks both ring-buffer reads, waits for the correlator goroutine
+// to finish, and releases all resources. The events channel is closed by
+// correlate itself once both feeders have drained, which happens before it
+// signals o.stopped, so Stop can safely wait on o.stopped alone and must
+// not close o.events again. Safe to call once.
 func (o *Observer) Stop() error {
 	o.stopOnce.Do(func() {
-		_ = o.reader.Close() // unblocks readLoop's Read with ErrClosed
+		_ = o.reader.Close() // unblocks netFeed's Read with ErrClosed
+		if o.sslReader != nil {
+			_ = o.sslReader.Close() // unblocks sslFeed's Read with ErrClosed
+		}
 		<-o.stopped
+		if o.sslWriteLink != nil {
+			_ = o.sslWriteLink.Close()
+		}
+		_ = o.tlsObjs.Close()
 		_ = o.closeLink.Close()
 		_ = o.sendmsgLink.Close()
 		_ = o.sendtoLink.Close()
 		_ = o.writeLink.Close()
 		_ = o.connectLink.Close()
 		_ = o.objs.Close()
-		close(o.events)
 	})
 	return nil
 }
 
-func (o *Observer) readLoop() {
+// netRecord is one decoded net_events ring-buffer record.
+type netRecord struct {
+	hdr     bpfNetEventHdr
+	payload []byte
+}
+
+// sslRecord is one decoded ssl_events ring-buffer record.
+type sslRecord struct {
+	hdr     tlsbpfSslFrameHdr
+	payload []byte
+}
+
+// correlate is the single goroutine that owns all correlator state (o.conns,
+// o.pending, o.coverage): it drives both ring buffers via one select loop,
+// per design doc section 6. The two feeder goroutines below exist only
+// because cilium/ebpf's ringbuf.Reader.Read is a blocking call with no
+// select-able primitive of its own; they decode records and hand them to
+// this goroutine, doing no correlation themselves.
+func (o *Observer) correlate() {
 	defer close(o.stopped)
+	defer close(o.events)
+
+	netCh := make(chan netRecord, 64)
+	go o.netFeed(netCh)
+
+	var sslCh chan sslRecord
+	sslOpen := o.sslReader != nil
+	if sslOpen {
+		sslCh = make(chan sslRecord, 64)
+		go o.sslFeed(sslCh)
+	}
+
+	// The frame that validated the chosen SSL_write candidate (see
+	// attachAndValidateTLS) was consumed straight off the ring buffer
+	// before this goroutine, and any feeder, existed. Replay it first so a
+	// tracked process that calls SSL_write only once still gets its
+	// content correlated.
+	if o.validationFrame != nil {
+		ts := time.Unix(0, int64(o.validationFrame.hdr.TsNs)+o.bootOffsetNs)
+		o.handleSSLFrame(o.validationFrame.hdr.Tgid, o.validationFrame.hdr.Tid, o.validationFrame.payload, ts)
+		o.validationFrame = nil
+	}
+
+	netOpen := true
+	for netOpen || sslOpen {
+		select {
+		case rec, ok := <-netCh:
+			if !ok {
+				netOpen = false
+				continue
+			}
+			o.handleNetRecord(rec)
+
+		case rec, ok := <-sslCh:
+			if !ok {
+				sslOpen = false
+				continue
+			}
+			ts := time.Unix(0, int64(rec.hdr.TsNs)+o.bootOffsetNs)
+			o.handleSSLFrame(rec.hdr.Tgid, rec.hdr.Tid, rec.payload, ts)
+		}
+	}
+}
+
+func (o *Observer) netFeed(out chan<- netRecord) {
+	defer close(out)
 
 	var hdr bpfNetEventHdr
 	hdrSize := binary.Size(hdr)
@@ -279,48 +588,90 @@ func (o *Observer) readLoop() {
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &hdr); err != nil {
 			continue
 		}
-
-		key := connKeyGo{tgid: hdr.Tgid, fd: hdr.Fd}
-		ts := time.Unix(0, int64(hdr.TsNs)+o.bootOffsetNs)
-
-		switch hdr.Type {
-		case netConnect:
-			o.conns[key] = &connection{
-				family:   hdr.Family,
-				addr:     hdr.Addr,
-				port:     hdr.Port,
-				openedAt: ts,
-			}
-
-		case netHello:
-			conn, ok := o.conns[key]
-			if !ok {
-				continue
-			}
-			payloadEnd := hdrSize + int(hdr.PayloadLen)
-			if payloadEnd > len(record.RawSample) {
-				continue
-			}
-			payload := record.RawSample[hdrSize:payloadEnd]
-			hello, err := tlsparse.ParseClientHello(payload)
-			if err != nil || hello.ServerName == "" {
-				continue
-			}
-			conn.host = hello.ServerName
-			conn.alpn = hello.ALPN
-			o.emit(key, conn, int32(hdr.Tgid), ts)
-
-		case netBind:
-			// No-op until tls.bpf.c exists; net.bpf.c never emits this yet.
-			continue
-
-		case netClose:
-			conn, ok := o.conns[key]
-			if ok {
-				o.emit(key, conn, int32(hdr.Tgid), ts)
-			}
-			delete(o.conns, key)
+		payloadEnd := hdrSize + int(hdr.PayloadLen)
+		var payload []byte
+		if hdr.PayloadLen > 0 && payloadEnd <= len(record.RawSample) {
+			payload = append([]byte(nil), record.RawSample[hdrSize:payloadEnd]...)
 		}
+		out <- netRecord{hdr: hdr, payload: payload}
+	}
+}
+
+func (o *Observer) sslFeed(out chan<- sslRecord) {
+	defer close(out)
+
+	var hdr tlsbpfSslFrameHdr
+	hdrSize := binary.Size(hdr)
+
+	for {
+		record, err := o.sslReader.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			continue
+		}
+		if len(record.RawSample) < hdrSize {
+			continue
+		}
+		if err := binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &hdr); err != nil {
+			continue
+		}
+		payloadEnd := hdrSize + int(hdr.Len)
+		if payloadEnd > len(record.RawSample) {
+			continue
+		}
+		payload := append([]byte(nil), record.RawSample[hdrSize:payloadEnd]...)
+		out <- sslRecord{hdr: hdr, payload: payload}
+	}
+}
+
+func (o *Observer) handleNetRecord(rec netRecord) {
+	hdr := rec.hdr
+	key := connKeyGo{tgid: hdr.Tgid, fd: hdr.Fd}
+	ts := time.Unix(0, int64(hdr.TsNs)+o.bootOffsetNs)
+
+	switch hdr.Type {
+	case netConnect:
+		o.conns[key] = &connection{
+			family:   hdr.Family,
+			addr:     hdr.Addr,
+			port:     hdr.Port,
+			openedAt: ts,
+		}
+		o.coverage.Connections++
+
+	case netHello:
+		conn, ok := o.conns[key]
+		if !ok {
+			return
+		}
+		hello, err := tlsparse.ParseClientHello(rec.payload)
+		if err != nil || hello.ServerName == "" {
+			return
+		}
+		conn.host = hello.ServerName
+		conn.alpn = hello.ALPN
+		o.coverage.WithHostname++
+		for _, proto := range hello.ALPN {
+			if proto == "h2" {
+				o.coverage.ContentUnsupported++
+				break
+			}
+		}
+		o.emit(key, conn, int32(hdr.Tgid), ts)
+
+	case netBind:
+		// No-op: the write-bracket join this event existed for is
+		// abandoned (D1, design doc section 13); net.bpf.c never emits it.
+		return
+
+	case netClose:
+		conn, ok := o.conns[key]
+		if ok {
+			o.emit(key, conn, int32(hdr.Tgid), ts)
+		}
+		delete(o.conns, key)
 	}
 }
 
