@@ -17,7 +17,6 @@ import (
 )
 
 const tier3FetchURL = "https://example.com"
-const tier3FetchHost = "example.com"
 
 // runTier3Agent runs the simulated agent with filesystem, process, and network
 // probes active. The agent performs its usual file + subprocess operations and

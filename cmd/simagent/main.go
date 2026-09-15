@@ -186,7 +186,7 @@ func main() {
 		if err != nil {
 			log.Printf("fetch %s: %v (ignoring for trajectory purposes)", fetchURL, err)
 		} else {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 
 		// Record what we did: a network connection to the host.

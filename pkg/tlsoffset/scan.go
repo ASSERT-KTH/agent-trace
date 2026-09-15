@@ -28,7 +28,7 @@ func ScanELF(path string) ([]Candidate, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("open elf: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	buildID := getBuildID(f)
 
