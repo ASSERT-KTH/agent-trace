@@ -1,14 +1,18 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +40,12 @@ func main() {
 	flag.BoolVar(&fileOnly, "file-only", false, "Skip the subprocess step, producing a trajectory with only filesystem actions (for Tier 1, where no process probe runs)")
 	flag.StringVar(&attack, "attack", "", "Simulate an attack scenario: 'omission', 'fabrication', 'substitution-exit', 'substitution-hash', 'substitution-cmd', 'net-omission', 'net-fabrication'")
 	flag.StringVar(&fetchURL, "fetch-url", "", "If set, run `curl -s -o /dev/null -m 10 <url>` and record a NetConnect trajectory entry for the host")
+	var fetchMethod, fetchBody string
+	var emitNetRequest bool
+	flag.StringVar(&fetchMethod, "fetch-method", "GET", "HTTP method to use for fetch (simulates net request)")
+	flag.StringVar(&fetchBody, "fetch-body", "", "HTTP body to send (for POST/PUT)")
+	flag.BoolVar(&emitNetRequest, "emit-net-request", false, "Emit a NetRequest entry with RequestHash instead of just NetConnect")
+
 	flag.Parse()
 
 	if workspace == "" || trajectoryOut == "" {
@@ -65,6 +75,14 @@ func main() {
 			ActionType: action,
 			Target:     target,
 			InputHash:  &inputHash,
+		})
+	}
+	addEntryWithRequestHash := func(action models.ActionType, target, requestHash string) {
+		trajectory = append(trajectory, models.TrajectoryEntry{
+			Timestamp:  time.Now(),
+			ActionType: action,
+			Target:     target,
+			RequestHash: &requestHash,
 		})
 	}
 
@@ -182,7 +200,16 @@ func main() {
 		// Go's crypto/tls sends a proper TLS ClientHello with an SNI
 		// extension on the first write, so the BPF netHello path will
 		// extract the hostname even though we are not using OpenSSL.
-		resp, err := httpClient.Get(fetchURL)
+		var bodyReader io.Reader
+		if fetchBody != "" {
+			bodyReader = strings.NewReader(fetchBody)
+		}
+		req, err := http.NewRequest(fetchMethod, fetchURL, bodyReader)
+		if err != nil {
+			log.Fatalf("new request: %v", err)
+		}
+
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			log.Printf("fetch %s: %v (ignoring for trajectory purposes)", fetchURL, err)
 		} else {
@@ -191,6 +218,23 @@ func main() {
 
 		// Record what we did: a network connection to the host.
 		addEntry(models.NetConnect, fetchHost)
+
+		if emitNetRequest {
+			port := 0
+			if u.Port() != "" {
+				port, _ = strconv.Atoi(u.Port())
+			} else if u.Scheme == "https" {
+				port = 443
+			}
+			target := models.CanonicalNetTarget(fetchMethod, fetchHost, port, u.Path, u.RawQuery)
+			if fetchBody != "" {
+				h := sha256.Sum256([]byte(fetchBody))
+				hashStr := "sha256:" + hex.EncodeToString(h[:])
+				addEntryWithRequestHash(models.NetRequest, target, hashStr)
+			} else {
+				addEntry(models.NetRequest, target)
+			}
+		}
 
 		delay()
 	}
