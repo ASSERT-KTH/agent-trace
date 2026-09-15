@@ -94,7 +94,22 @@ func TestTier5_E2E_NetRequest_Content_Faithful(t *testing.T) {
 	config := matching.Config{Delta: 10 * time.Second}
 	verdict := verification.Verify(tr, g, config)
 	if !verdict.Faithful {
-		t.Fatalf("expected FAITHFUL verdict, got: %#v", verdict)
+		t.Errorf("expected FAITHFUL verdict")
+		t.Logf("Unwitnessed: %d", len(verdict.Unwitnessed))
+		for _, e := range verdict.Unwitnessed {
+			t.Logf("  unwitnessed: %s %s", e.ActionType, e.Target)
+		}
+		t.Logf("Unrecorded: %d", len(verdict.Unrecorded))
+		for _, e := range verdict.Unrecorded {
+			t.Logf("  unrecorded: %s %s", e.ActionType, e.Target)
+		}
+		t.Logf("Mismatched: %d", len(verdict.Mismatched))
+		for _, m := range verdict.Mismatched {
+			t.Logf("  mismatched: %s %s", m.Entry.ActionType, m.Entry.Target)
+			t.Logf("    entry hash: %v", m.Entry.RequestHash)
+			t.Logf("    event hash: %v", m.Event.RequestHash)
+		}
+		t.Fatalf("verdict was not faithful")
 	}
 
 	foundReq := false
@@ -110,7 +125,18 @@ func TestTier5_E2E_NetRequest_Content_Faithful(t *testing.T) {
 		}
 	}
 	if !foundReq {
-		t.Error("expected to corroborate a NetRequest action")
+		t.Errorf("expected to corroborate a NetRequest action. Ground truth has %d events, Trajectory has %d entries.", len(g), len(tr))
+		for _, e := range g {
+			if e.ActionType == models.NetRequest {
+				t.Logf("Found NetRequest in ground truth: %s (hash: %v)", e.Target, e.RequestHash)
+			}
+		}
+		for _, e := range tr {
+			if e.ActionType == models.NetRequest {
+				t.Logf("Found NetRequest in trajectory: %s (hash: %v)", e.Target, e.RequestHash)
+			}
+		}
+		t.FailNow()
 	}
 }
 
@@ -136,9 +162,18 @@ func TestTier5_E2E_NetRequest_Content_Substitution(t *testing.T) {
 	for _, pair := range verdict.Mismatched {
 		if pair.Entry.ActionType == models.NetRequest {
 			foundMismatch = true
+			t.Logf("Successfully caught Mismatched NetRequest for %s: entry hash %v, event hash %v", 
+				pair.Entry.Target, pair.Entry.RequestHash, pair.Event.RequestHash)
 		}
 	}
 	if !foundMismatch {
-		t.Errorf("expected Mismatched NetRequest, got %#v", verdict)
+		t.Errorf("expected Mismatched NetRequest")
+		for _, e := range verdict.Unwitnessed {
+			t.Logf("  unwitnessed: %s %s", e.ActionType, e.Target)
+		}
+		for _, e := range verdict.Unrecorded {
+			t.Logf("  unrecorded: %s %s", e.ActionType, e.Target)
+		}
+		t.FailNow()
 	}
 }
