@@ -33,4 +33,6 @@ jobs:
         with:
           # govulncheck@latest now requires Go 1.26; keep the build and test
           # workflows on the project's supported Go 1.25 toolchain.
-          go-version-input: '1.26.0'
+          # We use 1.26.6 specifically to avoid govulncheck flagging vulnerabilities
+          # present in earlier 1.26.x standard libraries.
+          go-version-input: '1.26.6'
