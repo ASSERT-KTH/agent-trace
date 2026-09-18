@@ -71,3 +71,16 @@ If it's not in `STATE.md`, the next agent won't know about it. Project all trans
 ## Agentic CI & TDD
 
 Shift Left via Agent Self-Correction: Before you attempt to commit any code or state that you have finished your turn, you MUST locally run `sudo go test -v ./...` and `go vet ./...` (or `golangci-lint run` if available). Act as your own IDE. Never commit broken code or ignore unhandled errors. If a test or linter fails, fix it immediately.
+
+## Measurement Discipline
+
+This project's central claim is a verdict (FAITHFUL / NOT FAITHFUL, MISMATCHED, CORROBORATED). Every such verdict is a measurement, and this is a research prototype for a paper, so the measurement has to survive scrutiny, not just pass locally. Full rationale and worked examples: `docs/methodology/being_data_driven.md`. Read it before designing a new experiment, probe, or E2E tier. In this repo, in practice:
+
+- **Name the premise before building on it.** Before trusting a new probe or matcher on real trajectories, state the assumption you're least sure of (e.g. "curl opens exactly one connection per fetch" — false, see Tier 5 Happy-Eyeballs) and check it cheaply first.
+- **Pre-register GO/STOP thresholds in the test/tool, before running it**, not after seeing the result. A verdict decided after the fact is a negotiation, not a measurement.
+- **No verdict without a control.** A corroboration-rate change is only meaningful relative to the same rate measured on an unmodified baseline in the same run/environment. If there's no control, the tool should print UNJUDGED, not a verdict.
+- **Validate new instrumentation against a known answer first.** A new probe's first real test should be against `simagent` with a fully scripted, known action sequence, before it's trusted on an unscripted trajectory.
+- **Distinguish "not measured" from "measured zero."** Use an explicit `ok bool` or `*T`, never a bare zero default — this is why a nil `RequestHash` must not silently corroborate against a hashed ground-truth event (`pkg/verification/verification.go`).
+- **Report `considered` / `evaluated` / `succeeded` together**, and count what couldn't be evaluated (skipped tiers, attach failures) instead of dropping it.
+- **A proxy passing (e.g. 100% on the current E2E suite) is not the same as coverage of the threat model.** Check coverage against `docs/related_work/01_threat_models.md` periodically, not just test pass/fail.
+- **Log abandoned approaches and corrected numbers** in the changelog section of `docs/methodology/being_data_driven.md` when they're relevant to a paper claim, so they aren't silently lost or re-attempted.
