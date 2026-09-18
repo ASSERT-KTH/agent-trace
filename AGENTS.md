@@ -84,3 +84,12 @@ This project's central claim is a verdict (FAITHFUL / NOT FAITHFUL, MISMATCHED, 
 - **Report `considered` / `evaluated` / `succeeded` together**, and count what couldn't be evaluated (skipped tiers, attach failures) instead of dropping it.
 - **A proxy passing (e.g. 100% on the current E2E suite) is not the same as coverage of the threat model.** Check coverage against `docs/related_work/01_threat_models.md` periodically, not just test pass/fail.
 - **Log abandoned approaches and corrected numbers** in the changelog section of `docs/methodology/being_data_driven.md` when they're relevant to a paper claim, so they aren't silently lost or re-attempted.
+
+## CI Discipline
+
+Tests run twice: once on your dev box, once on GitHub Actions' shared `ubuntu-latest` runners in `.github/workflows/test.yml`. `sudo go test -v ./...` passing locally is necessary, not sufficient — the runner is slower, shared, and sometimes cold-starting, and eBPF attach/ring-buffer timing can differ from a local box in ways that don't show up until CI.
+
+- **Design timing-sensitive tests for CI, not your dev box.** Fixed `time.Sleep` windows around probe attach, process forking, or ring-buffer draining (e.g. `cmd/watch/main_test.go`) must budget for a contended GitHub-hosted runner, not local timing. Prefer synchronizing on an explicit signal over a bare sleep; when a sleep is unavoidable, size it generously and say in a comment that CI sets the bound, not the dev box.
+- **A pass on this box is a hypothesis, not a result.** After any commit that touches probes, timing, or CI-relevant code, push and watch the actual CI run before treating the change as done.
+- **Watch CI after every push, without being asked.** Immediately after pushing to `main` or opening a PR, run `gh run list --limit 1` (or `gh run watch <run-id> --exit-status`) and report pass/fail back in the same turn, so failures get fixed while context is still loaded instead of discovered later.
+- **A CI failure needs a verdict before moving on**: transient flake (rerun once with `gh run rerun <run-id> --failed`; if it then passes, record it under STATE.md's "Known Flaky Tests") vs. real regression (fix it) vs. environment-specific gap (kernel/BTF difference on the runner — add a debug step to the workflow, don't guess with a timeout bump).
