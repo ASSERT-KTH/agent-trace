@@ -154,11 +154,21 @@ func TestObserver_UntrackedProcessIsInvisible(t *testing.T) {
 	const host = "agenttrace-untracked.internal"
 	addr := startTLSServer(t, host)
 
-	// Track only our own PID, not the openssl subprocess we're about to
-	// spawn -- this is the pid-scoping behavior the design doc's tracked_pids
-	// gate exists for (section 4.1): a connection from a process outside
-	// the tracked set must never surface as a ground-truth event.
-	obs, err := New(Config{TrackedPID: int32(os.Getpid()), EventBufSize: 256})
+	// Track a decoy process, not our own PID -- the observer now propagates
+	// tracked_pids to descendants on fork (task_newtask, for --fetch-via-curl
+	// style subprocess tracking), so tracking our own PID would make the
+	// openssl child below tracked too, defeating the point of this test.
+	// The decoy has no relation to the openssl process spawned below, so
+	// this still exercises the tracked_pids gate from the design doc
+	// (section 4.1): a connection from a process outside the tracked set
+	// and its descendants must never surface as a ground-truth event.
+	decoy := exec.Command("sleep", "5")
+	if err := decoy.Start(); err != nil {
+		t.Fatalf("start decoy: %v", err)
+	}
+	t.Cleanup(func() { _ = decoy.Process.Kill() })
+
+	obs, err := New(Config{TrackedPID: int32(decoy.Process.Pid), EventBufSize: 256})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
